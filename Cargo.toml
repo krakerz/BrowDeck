@@ -1,0 +1,18 @@
+[package]
+name = "browdeck"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "browdeck"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.36.1"
+egui = "0.36.1"
+egui_material_icons = "0.8.0"
+gilrs = "0.11.2"
+open = "5.4.3"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.5"
+trash = "5.2.7"
