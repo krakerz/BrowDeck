@@ -1,10 +1,17 @@
-use crate::{deleted, fileops, gamepad, mounts, places};
+use crate::{deleted, fileops, fonts, gamepad, mounts, places};
+use egui_material_icons::MaterialIcon;
 use egui_material_icons::icons::{
     ICON_ARROW_UPWARD, ICON_CONTENT_COPY, ICON_CONTENT_CUT, ICON_CONTENT_PASTE, ICON_DELETE,
-    ICON_DESCRIPTION, ICON_FOLDER, ICON_MENU, ICON_REFRESH, ICON_RESTORE_FROM_TRASH,
+    ICON_DESCRIPTION, ICON_FOLDER, ICON_MENU, ICON_REFRESH, ICON_RESTORE_FROM_TRASH, ICON_ZOOM_IN,
+    ICON_ZOOM_OUT,
 };
 use std::path::PathBuf;
 use std::time::Duration;
+
+/// Base size (px) icons render at before `icon_scale` is applied.
+const BASE_ICON_SIZE: f32 = 18.0;
+const ICON_SCALE_STEP: f32 = 0.15;
+const ICON_SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.7..=2.5;
 
 struct Entry {
     name: String,
@@ -34,6 +41,8 @@ pub struct BrowDeckApp {
     clipboard: Option<Clipboard>,
     jobs: Vec<fileops::Job>,
     gamepad: Option<gamepad::GamepadInput>,
+    icon_scale: f32,
+    show_all_mounts: bool,
 }
 
 /// How long a finished copy/move job stays visible in the overlay before
@@ -43,6 +52,7 @@ const JOB_LINGER: Duration = Duration::from_secs(2);
 impl BrowDeckApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         egui_material_icons::initialize(&cc.egui_ctx);
+        fonts::install_cjk_fallback(&cc.egui_ctx);
         let home = std::env::var("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/"));
@@ -58,9 +68,18 @@ impl BrowDeckApp {
             clipboard: None,
             jobs: Vec::new(),
             gamepad: gamepad::GamepadInput::new(),
+            icon_scale: 1.0,
+            show_all_mounts: false,
         };
         app.refresh();
         app
+    }
+
+    /// Renders a [`MaterialIcon`] at the current icon scale — use this
+    /// instead of a bare `ICON_*` constant everywhere in the UI so the
+    /// zoom +/- toolbar buttons affect every icon consistently.
+    fn icon(&self, icon: MaterialIcon) -> egui::RichText {
+        icon.rich_text().size(BASE_ICON_SIZE * self.icon_scale)
     }
 
     fn navigate_to(&mut self, dir: PathBuf) {
@@ -171,17 +190,17 @@ impl eframe::App for BrowDeckApp {
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button(ICON_MENU).clicked() {
+                if ui.button(self.icon(ICON_MENU)).clicked() {
                     self.sidebar_open = !self.sidebar_open;
                 }
-                if ui.button((ICON_ARROW_UPWARD, "Up")).clicked() {
+                if ui.button((self.icon(ICON_ARROW_UPWARD), "Up")).clicked() {
                     self.go_back();
                 }
                 ui.separator();
                 if ui
                     .add_enabled(
                         self.selected.is_some(),
-                        egui::Button::new((ICON_CONTENT_COPY, "Copy")),
+                        egui::Button::new((self.icon(ICON_CONTENT_COPY), "Copy")),
                     )
                     .clicked()
                     && let Some(path) = self.selected.clone()
@@ -191,7 +210,7 @@ impl eframe::App for BrowDeckApp {
                 if ui
                     .add_enabled(
                         self.selected.is_some(),
-                        egui::Button::new((ICON_CONTENT_CUT, "Cut")),
+                        egui::Button::new((self.icon(ICON_CONTENT_CUT), "Cut")),
                     )
                     .clicked()
                     && let Some(path) = self.selected.clone()
@@ -201,7 +220,7 @@ impl eframe::App for BrowDeckApp {
                 if ui
                     .add_enabled(
                         self.clipboard.is_some() && matches!(self.view, View::Dir),
-                        egui::Button::new((ICON_CONTENT_PASTE, "Paste")),
+                        egui::Button::new((self.icon(ICON_CONTENT_PASTE), "Paste")),
                     )
                     .clicked()
                 {
@@ -210,11 +229,34 @@ impl eframe::App for BrowDeckApp {
                 if ui
                     .add_enabled(
                         self.selected.is_some(),
-                        egui::Button::new((ICON_DELETE, "Delete")),
+                        egui::Button::new((self.icon(ICON_DELETE), "Delete")),
                     )
                     .clicked()
                 {
                     self.delete_selected();
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(
+                        *ICON_SCALE_RANGE.start() < self.icon_scale,
+                        egui::Button::new(self.icon(ICON_ZOOM_OUT)),
+                    )
+                    .on_hover_text("Smaller icons")
+                    .clicked()
+                {
+                    self.icon_scale = (self.icon_scale - ICON_SCALE_STEP)
+                        .clamp(*ICON_SCALE_RANGE.start(), *ICON_SCALE_RANGE.end());
+                }
+                if ui
+                    .add_enabled(
+                        self.icon_scale < *ICON_SCALE_RANGE.end(),
+                        egui::Button::new(self.icon(ICON_ZOOM_IN)),
+                    )
+                    .on_hover_text("Bigger icons")
+                    .clicked()
+                {
+                    self.icon_scale = (self.icon_scale + ICON_SCALE_STEP)
+                        .clamp(*ICON_SCALE_RANGE.start(), *ICON_SCALE_RANGE.end());
                 }
                 ui.separator();
                 match self.view {
@@ -230,7 +272,7 @@ impl eframe::App for BrowDeckApp {
                 let mut clicked_place = None;
                 for place in &self.places {
                     if ui
-                        .selectable_label(false, (place.icon, place.label.as_str()))
+                        .selectable_label(false, (self.icon(place.icon), place.label.as_str()))
                         .clicked()
                     {
                         clicked_place = Some(place.path.clone());
@@ -240,18 +282,24 @@ impl eframe::App for BrowDeckApp {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.heading("Mounts");
-                    if ui.small_button(ICON_REFRESH).clicked() {
+                    if ui.small_button(self.icon(ICON_REFRESH)).clicked() {
                         self.mounts = mounts::list_mounts();
                     }
                 });
-                if self.mounts.is_empty() {
+                ui.checkbox(&mut self.show_all_mounts, "Show all");
+                let visible_mounts: Vec<&mounts::Mount> = self
+                    .mounts
+                    .iter()
+                    .filter(|m| self.show_all_mounts || m.is_common_location())
+                    .collect();
+                if visible_mounts.is_empty() {
                     ui.weak("(none)");
                 }
                 let mut clicked_mount = None;
-                for mount in &self.mounts {
+                for mount in visible_mounts {
                     let mount_label = mount.mount_point.to_string_lossy().into_owned();
                     let response = ui
-                        .selectable_label(false, (mount.icon(), mount_label.as_str()))
+                        .selectable_label(false, (self.icon(mount.icon()), mount_label.as_str()))
                         .on_hover_text(&mount.device);
                     if response.clicked() {
                         clicked_mount = Some(mount.mount_point.clone());
@@ -263,7 +311,10 @@ impl eframe::App for BrowDeckApp {
 
                 ui.add_space(8.0);
                 if ui
-                    .selectable_label(matches!(self.view, View::Trash), (ICON_DELETE, "Trash"))
+                    .selectable_label(
+                        matches!(self.view, View::Trash),
+                        (self.icon(ICON_DELETE), "Trash"),
+                    )
                     .clicked()
                 {
                     self.open_trash();
@@ -282,64 +333,69 @@ impl eframe::App for BrowDeckApp {
 
 impl BrowDeckApp {
     fn show_dir(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            let mut next_dir = None;
-            let mut open_file = None;
-            for entry in &self.entries {
-                let icon = if entry.is_dir {
-                    ICON_FOLDER
-                } else {
-                    ICON_DESCRIPTION
-                };
-                let is_selected = self.selected.as_deref() == Some(entry.path.as_path());
-                let response = ui.selectable_label(is_selected, (icon, entry.name.as_str()));
-                if response.clicked() {
-                    self.selected = Some(entry.path.clone());
-                    if entry.is_dir {
-                        // Single click/gamepad-activate enters a directory —
-                        // double-click is reserved for opening files (mouse).
-                        next_dir = Some(entry.path.clone());
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let mut next_dir = None;
+                let mut open_file = None;
+                for entry in &self.entries {
+                    let icon = if entry.is_dir {
+                        ICON_FOLDER
+                    } else {
+                        ICON_DESCRIPTION
+                    };
+                    let is_selected = self.selected.as_deref() == Some(entry.path.as_path());
+                    let response =
+                        ui.selectable_label(is_selected, (self.icon(icon), entry.name.as_str()));
+                    if response.clicked() {
+                        self.selected = Some(entry.path.clone());
+                        if entry.is_dir {
+                            // Single click/gamepad-activate enters a directory —
+                            // double-click is reserved for opening files (mouse).
+                            next_dir = Some(entry.path.clone());
+                        }
+                    }
+                    if response.double_clicked() && !entry.is_dir {
+                        open_file = Some(entry.path.clone());
                     }
                 }
-                if response.double_clicked() && !entry.is_dir {
-                    open_file = Some(entry.path.clone());
+                if let Some(dir) = next_dir {
+                    self.navigate_to(dir);
                 }
-            }
-            if let Some(dir) = next_dir {
-                self.navigate_to(dir);
-            }
-            if let Some(path) = open_file
-                && let Err(e) = open::that(&path)
-            {
-                eprintln!("open failed: {e}");
-            }
-        });
+                if let Some(path) = open_file
+                    && let Err(e) = open::that(&path)
+                {
+                    eprintln!("open failed: {e}");
+                }
+            });
     }
 
     fn show_trash(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            let mut restore_idx = None;
-            for (i, entry) in self.trash_entries.iter().enumerate() {
-                let label = format!(
-                    "{}  (from {})",
-                    entry.name,
-                    entry.original_path.to_string_lossy()
-                );
-                if ui
-                    .selectable_label(false, (ICON_RESTORE_FROM_TRASH, label))
-                    .double_clicked()
-                {
-                    restore_idx = Some(i);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let mut restore_idx = None;
+                for (i, entry) in self.trash_entries.iter().enumerate() {
+                    let label = format!(
+                        "{}  (from {})",
+                        entry.name,
+                        entry.original_path.to_string_lossy()
+                    );
+                    if ui
+                        .selectable_label(false, (self.icon(ICON_RESTORE_FROM_TRASH), label))
+                        .double_clicked()
+                    {
+                        restore_idx = Some(i);
+                    }
                 }
-            }
-            if let Some(i) = restore_idx {
-                let entry = &self.trash_entries[i];
-                if let Err(e) = deleted::restore(entry) {
-                    eprintln!("restore failed: {e}");
+                if let Some(i) = restore_idx {
+                    let entry = &self.trash_entries[i];
+                    if let Err(e) = deleted::restore(entry) {
+                        eprintln!("restore failed: {e}");
+                    }
+                    self.trash_entries = deleted::list_trash();
                 }
-                self.trash_entries = deleted::list_trash();
-            }
-        });
+            });
     }
 
     fn show_progress_overlay(&self, ctx: &egui::Context) {

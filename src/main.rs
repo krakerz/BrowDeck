@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod deleted;
 mod fileops;
+mod fonts;
 mod gamepad;
 mod mounts;
 mod places;

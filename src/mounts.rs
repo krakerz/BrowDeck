@@ -18,15 +18,26 @@ impl Mount {
             ICON_USB
         }
     }
+
+    /// Whether this is one of the conventional removable-media mount
+    /// locations (`/media/*`, `/mnt/*`) — the default, uncluttered sidebar
+    /// view shows only these; internal system mounts (`/`, `/var/log`, …)
+    /// are opt-in via "show all".
+    pub fn is_common_location(&self) -> bool {
+        self.mount_point.starts_with("/media") || self.mount_point.starts_with("/mnt")
+    }
 }
 
 /// Real block-device mounts from `/proc/mounts` (pseudo filesystems like
-/// proc/sysfs/tmpfs have a non-`/dev/*` "device" field and are skipped).
+/// proc/sysfs/tmpfs have a non-`/dev/*` "device" field and are skipped),
+/// sorted ascending by mount point.
 pub fn list_mounts() -> Vec<Mount> {
     let Ok(contents) = std::fs::read_to_string("/proc/mounts") else {
         return Vec::new();
     };
-    contents.lines().filter_map(parse_mount_line).collect()
+    let mut mounts: Vec<Mount> = contents.lines().filter_map(parse_mount_line).collect();
+    mounts.sort_by(|a, b| a.mount_point.cmp(&b.mount_point));
+    mounts
 }
 
 fn parse_mount_line(line: &str) -> Option<Mount> {
