@@ -22,3 +22,8 @@ pub fn list_trash() -> Vec<TrashEntry> {
 pub fn restore(entry: &TrashEntry) -> Result<(), String> {
     trash::os_limited::restore_all([entry.item.clone()]).map_err(|e| e.to_string())
 }
+
+pub fn empty_all() -> Result<(), String> {
+    let items = trash::os_limited::list().unwrap_or_default();
+    trash::os_limited::purge_all(items).map_err(|e| e.to_string())
+}

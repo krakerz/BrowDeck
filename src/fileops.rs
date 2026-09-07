@@ -50,12 +50,28 @@ pub fn spawn_move(sources: Vec<PathBuf>, dest_dir: PathBuf) -> Job {
     spawn_job("Moving", sources, dest_dir, true)
 }
 
-/// Only `.zip` for now (common case, deflate only) — `.tar`/`.tar.gz` are a
-/// deliberate follow-up, not this pass.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArchiveKind {
+    Zip,
+    Tar,
+    TarGz,
+}
+
+fn archive_kind(path: &Path) -> Option<ArchiveKind> {
+    let name = path.file_name()?.to_str()?.to_lowercase();
+    if name.ends_with(".zip") {
+        Some(ArchiveKind::Zip)
+    } else if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        Some(ArchiveKind::TarGz)
+    } else if name.ends_with(".tar") {
+        Some(ArchiveKind::Tar)
+    } else {
+        None
+    }
+}
+
 pub fn is_archive(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
+    archive_kind(path).is_some()
 }
 
 pub fn spawn_extract(archive: PathBuf, dest_dir: PathBuf) -> Job {
@@ -73,35 +89,12 @@ pub fn spawn_extract(archive: PathBuf, dest_dir: PathBuf) -> Job {
 }
 
 fn run_extract(archive_path: &Path, dest_dir: &Path, tx: &Sender<ProgressMsg>) {
-    let result = (|| -> Result<(), String> {
-        let file = std::fs::File::open(archive_path).map_err(|e| e.to_string())?;
-        let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
-        let total = archive.len().max(1) as u64;
-        let _ = tx.send(ProgressMsg::Progress { done: 0, total });
-        for i in 0..archive.len() {
-            let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
-            // `enclosed_name` rejects absolute paths and `..` components —
-            // skip anything a malicious archive could use to escape dest_dir.
-            if let Some(rel_path) = entry.enclosed_name() {
-                let out_path = dest_dir.join(rel_path);
-                if entry.is_dir() {
-                    std::fs::create_dir_all(&out_path).map_err(|e| e.to_string())?;
-                } else {
-                    if let Some(parent) = out_path.parent() {
-                        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-                    }
-                    let mut out_file =
-                        std::fs::File::create(&out_path).map_err(|e| e.to_string())?;
-                    std::io::copy(&mut entry, &mut out_file).map_err(|e| e.to_string())?;
-                }
-            }
-            let _ = tx.send(ProgressMsg::Progress {
-                done: (i + 1) as u64,
-                total,
-            });
-        }
-        Ok(())
-    })();
+    let result = match archive_kind(archive_path) {
+        Some(ArchiveKind::Zip) => extract_zip(archive_path, dest_dir, tx),
+        Some(ArchiveKind::Tar) => extract_tar(archive_path, dest_dir, tx),
+        Some(ArchiveKind::TarGz) => extract_tar_gz(archive_path, dest_dir, tx),
+        None => Err("unsupported archive format".to_string()),
+    };
     match result {
         Ok(()) => {
             let _ = tx.send(ProgressMsg::Done);
@@ -110,6 +103,97 @@ fn run_extract(archive_path: &Path, dest_dir: &Path, tx: &Sender<ProgressMsg>) {
             let _ = tx.send(ProgressMsg::Error(e));
         }
     }
+}
+
+fn extract_zip(
+    archive_path: &Path,
+    dest_dir: &Path,
+    tx: &Sender<ProgressMsg>,
+) -> Result<(), String> {
+    let file = std::fs::File::open(archive_path).map_err(|e| e.to_string())?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+    let total = archive.len().max(1) as u64;
+    let _ = tx.send(ProgressMsg::Progress { done: 0, total });
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+        // `enclosed_name` rejects absolute paths and `..` components —
+        // skip anything a malicious archive could use to escape dest_dir.
+        if let Some(rel_path) = entry.enclosed_name() {
+            let out_path = dest_dir.join(rel_path);
+            if entry.is_dir() {
+                std::fs::create_dir_all(&out_path).map_err(|e| e.to_string())?;
+            } else {
+                if let Some(parent) = out_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                let mut out_file = std::fs::File::create(&out_path).map_err(|e| e.to_string())?;
+                std::io::copy(&mut entry, &mut out_file).map_err(|e| e.to_string())?;
+            }
+        }
+        let _ = tx.send(ProgressMsg::Progress {
+            done: (i + 1) as u64,
+            total,
+        });
+    }
+    Ok(())
+}
+
+/// tar has no central directory (it's a flat entry stream), so there's no
+/// cheap way to know the entry count up front — this does a first pass
+/// (decompressing but not writing) purely to count entries for progress,
+/// then a second pass that actually extracts.
+fn extract_tar(
+    archive_path: &Path,
+    dest_dir: &Path,
+    tx: &Sender<ProgressMsg>,
+) -> Result<(), String> {
+    let count_file = std::fs::File::open(archive_path).map_err(|e| e.to_string())?;
+    let total = count_tar_entries(count_file)?.max(1);
+    let _ = tx.send(ProgressMsg::Progress { done: 0, total });
+    let file = std::fs::File::open(archive_path).map_err(|e| e.to_string())?;
+    extract_tar_entries(file, dest_dir, total, tx)
+}
+
+fn extract_tar_gz(
+    archive_path: &Path,
+    dest_dir: &Path,
+    tx: &Sender<ProgressMsg>,
+) -> Result<(), String> {
+    let count_file = std::fs::File::open(archive_path).map_err(|e| e.to_string())?;
+    let total = count_tar_entries(flate2::read::GzDecoder::new(count_file))?.max(1);
+    let _ = tx.send(ProgressMsg::Progress { done: 0, total });
+    let file = std::fs::File::open(archive_path).map_err(|e| e.to_string())?;
+    extract_tar_entries(flate2::read::GzDecoder::new(file), dest_dir, total, tx)
+}
+
+fn count_tar_entries<R: Read>(reader: R) -> Result<u64, String> {
+    let mut archive = tar::Archive::new(reader);
+    let mut count = 0u64;
+    for entry in archive.entries().map_err(|e| e.to_string())? {
+        entry.map_err(|e| e.to_string())?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn extract_tar_entries<R: Read>(
+    reader: R,
+    dest_dir: &Path,
+    total: u64,
+    tx: &Sender<ProgressMsg>,
+) -> Result<(), String> {
+    let mut archive = tar::Archive::new(reader);
+    for (i, entry) in archive.entries().map_err(|e| e.to_string())?.enumerate() {
+        let mut entry = entry.map_err(|e| e.to_string())?;
+        // `unpack_in` (not `unpack`) is the sanitizing variant — refuses to
+        // write outside `dest_dir` (path traversal / absolute paths).
+        entry.unpack_in(dest_dir).map_err(|e| e.to_string())?;
+        let _ = tx.send(ProgressMsg::Progress {
+            done: (i + 1) as u64,
+            total,
+        });
+    }
+    Ok(())
 }
 
 fn spawn_job(label: &str, sources: Vec<PathBuf>, dest_dir: PathBuf, is_move: bool) -> Job {
@@ -328,10 +412,13 @@ mod tests {
     }
 
     #[test]
-    fn is_archive_matches_zip_extension_case_insensitively() {
+    fn is_archive_matches_known_extensions_case_insensitively() {
         assert!(is_archive(Path::new("thing.zip")));
         assert!(is_archive(Path::new("thing.ZIP")));
-        assert!(!is_archive(Path::new("thing.tar.gz")));
+        assert!(is_archive(Path::new("thing.tar")));
+        assert!(is_archive(Path::new("thing.tar.gz")));
+        assert!(is_archive(Path::new("thing.TGZ")));
+        assert!(!is_archive(Path::new("thing.rar")));
         assert!(!is_archive(Path::new("thing")));
     }
 
@@ -364,6 +451,36 @@ mod tests {
             "hello from zip"
         );
         assert!(!root.join("escape.txt").exists());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn extract_tar_gz_writes_entries() {
+        let root = scratch_dir("targz");
+        let src = root.join("src_dir");
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::write(src.join("nested/inside.txt"), b"hello from tar.gz").unwrap();
+
+        let archive_path = root.join("test.tar.gz");
+        {
+            let file = std::fs::File::create(&archive_path).unwrap();
+            let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+            let mut builder = tar::Builder::new(encoder);
+            builder.append_dir_all("", &src).unwrap();
+            builder.into_inner().unwrap().finish().unwrap();
+        }
+        let dest_dir = root.join("dest");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+
+        let job = spawn_extract(archive_path, dest_dir.clone());
+        let (done, total) = wait_done(&job.receiver).unwrap();
+        assert_eq!(done, total);
+
+        assert_eq!(
+            std::fs::read_to_string(dest_dir.join("nested/inside.txt")).unwrap(),
+            "hello from tar.gz"
+        );
 
         std::fs::remove_dir_all(&root).unwrap();
     }
