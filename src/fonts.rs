@@ -16,10 +16,19 @@ pub fn install_cjk_fallback(ctx: &egui::Context) {
     ctx.add_font(FontInsert::new(
         "cjk-fallback",
         data,
-        vec![InsertFontFamily {
-            family: egui::FontFamily::Proportional,
-            priority: FontPriority::Lowest,
-        }],
+        vec![
+            InsertFontFamily {
+                family: egui::FontFamily::Proportional,
+                priority: FontPriority::Lowest,
+            },
+            // Also needed for `ui.monospace(...)` (e.g. the text preview
+            // pane) — Monospace is a separate family with its own fallback
+            // chain, registering on Proportional alone doesn't cover it.
+            InsertFontFamily {
+                family: egui::FontFamily::Monospace,
+                priority: FontPriority::Lowest,
+            },
+        ],
     ));
 }
 

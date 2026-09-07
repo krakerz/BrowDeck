@@ -5,7 +5,9 @@ mod fileops;
 mod fonts;
 mod gamepad;
 mod mounts;
+mod permissions;
 mod places;
+mod preview;
 
 fn main() -> eframe::Result<()> {
     let config = config::Config::load();

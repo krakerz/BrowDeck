@@ -50,6 +50,68 @@ pub fn spawn_move(sources: Vec<PathBuf>, dest_dir: PathBuf) -> Job {
     spawn_job("Moving", sources, dest_dir, true)
 }
 
+/// Only `.zip` for now (common case, deflate only) — `.tar`/`.tar.gz` are a
+/// deliberate follow-up, not this pass.
+pub fn is_archive(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
+}
+
+pub fn spawn_extract(archive: PathBuf, dest_dir: PathBuf) -> Job {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || run_extract(&archive, &dest_dir, &tx));
+    Job {
+        label: "Extracting".to_string(),
+        receiver: rx,
+        done: 0,
+        total: 1,
+        finished: false,
+        error: None,
+        finished_at: None,
+    }
+}
+
+fn run_extract(archive_path: &Path, dest_dir: &Path, tx: &Sender<ProgressMsg>) {
+    let result = (|| -> Result<(), String> {
+        let file = std::fs::File::open(archive_path).map_err(|e| e.to_string())?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+        let total = archive.len().max(1) as u64;
+        let _ = tx.send(ProgressMsg::Progress { done: 0, total });
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+            // `enclosed_name` rejects absolute paths and `..` components —
+            // skip anything a malicious archive could use to escape dest_dir.
+            if let Some(rel_path) = entry.enclosed_name() {
+                let out_path = dest_dir.join(rel_path);
+                if entry.is_dir() {
+                    std::fs::create_dir_all(&out_path).map_err(|e| e.to_string())?;
+                } else {
+                    if let Some(parent) = out_path.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                    }
+                    let mut out_file =
+                        std::fs::File::create(&out_path).map_err(|e| e.to_string())?;
+                    std::io::copy(&mut entry, &mut out_file).map_err(|e| e.to_string())?;
+                }
+            }
+            let _ = tx.send(ProgressMsg::Progress {
+                done: (i + 1) as u64,
+                total,
+            });
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            let _ = tx.send(ProgressMsg::Done);
+        }
+        Err(e) => {
+            let _ = tx.send(ProgressMsg::Error(e));
+        }
+    }
+}
+
 fn spawn_job(label: &str, sources: Vec<PathBuf>, dest_dir: PathBuf, is_move: bool) -> Job {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || run_job(&sources, &dest_dir, is_move, &tx));
@@ -261,6 +323,47 @@ mod tests {
             std::fs::read_to_string(dest_dir.join("src_dir/a.txt")).unwrap(),
             "hello"
         );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn is_archive_matches_zip_extension_case_insensitively() {
+        assert!(is_archive(Path::new("thing.zip")));
+        assert!(is_archive(Path::new("thing.ZIP")));
+        assert!(!is_archive(Path::new("thing.tar.gz")));
+        assert!(!is_archive(Path::new("thing")));
+    }
+
+    #[test]
+    fn extract_writes_entries_and_rejects_path_traversal() {
+        let root = scratch_dir("extract");
+        let archive_path = root.join("test.zip");
+        {
+            let file = std::fs::File::create(&archive_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+            zip.start_file("nested/inside.txt", options).unwrap();
+            zip.write_all(b"hello from zip").unwrap();
+            // A malicious entry trying to escape the destination directory —
+            // `enclosed_name()` should reject it and `run_extract` should
+            // just skip it rather than writing outside `dest_dir`.
+            zip.start_file("../escape.txt", options).unwrap();
+            zip.write_all(b"should not land here").unwrap();
+            zip.finish().unwrap();
+        }
+        let dest_dir = root.join("dest");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+
+        let job = spawn_extract(archive_path, dest_dir.clone());
+        let (done, total) = wait_done(&job.receiver).unwrap();
+        assert_eq!(done, total);
+
+        assert_eq!(
+            std::fs::read_to_string(dest_dir.join("nested/inside.txt")).unwrap(),
+            "hello from zip"
+        );
+        assert!(!root.join("escape.txt").exists());
 
         std::fs::remove_dir_all(&root).unwrap();
     }

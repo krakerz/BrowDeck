@@ -16,6 +16,8 @@ pub enum Action {
     /// Go up a directory / back out of the trash view.
     Back,
     ToggleSidebar,
+    /// Open/close the actions panel for the selected file.
+    ContextMenu,
 }
 
 pub struct GamepadInput {
@@ -119,6 +121,7 @@ fn action_for(button: Button) -> Option<Action> {
     match button {
         Button::South => Some(Action::Activate),
         Button::East => Some(Action::Back),
+        Button::North => Some(Action::ContextMenu),
         Button::Start => Some(Action::ToggleSidebar),
         _ => None,
     }
