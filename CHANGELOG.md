@@ -2,6 +2,14 @@
 
 ### Changed
 - Relicensed from MIT to GPL-3.0-or-later
+- The Quit confirmation (Start held 3s) is now a strip row (like Rename/
+  Permissions) instead of a popup
+
+### Fixed
+- The Quit confirmation popup could break gamepad input entirely on real
+  Steam Deck hardware (switched to acting like a mouse, requiring a hard
+  restart) — apparently from triggering Steam Input's own desktop/mouse-
+  mode remapping
 
 ## [1.3.0] — 2026-09-08
 

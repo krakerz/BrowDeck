@@ -307,15 +307,11 @@ pub struct BrowDeckApp {
     /// succeeds; every "what pane are we in" decision reads this instead
     /// of calling `focused_pane()` directly.
     current_pane: Option<Pane>,
-    /// True while the Start-held-3s Quit confirmation dialog is showing —
-    /// while set, gamepad input is handled entirely by its own self-
-    /// contained Left/Right/Activate/Back path (see the `Quit` action
-    /// arm), bypassing the normal focus/pane system so it can't leak.
+    /// True while the Start-held-3s Quit confirmation is showing — a
+    /// strip zone (`FooterZone::Quit`) like Rename/Permissions, not a
+    /// popup (see NOTES.md "quit confirmation modal broke gamepad
+    /// input" for why a real `egui::Modal` isn't used here).
     quit_confirm: bool,
-    /// Which button is highlighted in the Quit dialog — `false` (Cancel)
-    /// is the default so an accidental confirm always requires an
-    /// explicit Right + Activate, never just a stray Activate.
-    quit_confirm_yes: bool,
     /// Whether the title header above the toolbar shows — from
     /// `config.toml`'s `show_header`, fixed for the life of the app (no
     /// in-app toggle, unlike `show_hidden_files`/`show_all_mounts`).
@@ -396,7 +392,6 @@ impl BrowDeckApp {
             multi_selected: std::collections::HashSet::new(),
             current_pane: None,
             quit_confirm: false,
-            quit_confirm_yes: false,
             show_header,
         };
         app.refresh();
@@ -610,7 +605,21 @@ impl BrowDeckApp {
     /// view. Returns whether it closed something, so [`Self::back_or_up`]
     /// knows whether to fall back to going up a directory instead.
     fn escape(&mut self) -> bool {
-        if self.multi_select {
+        if self.quit_confirm {
+            // Highest priority — it's the most recent thing to have
+            // opened regardless of whatever else is open underneath.
+            self.quit_confirm = false;
+            // If something else was open underneath (rendering was just
+            // suppressed for the frame, not closed — see `active_zones`),
+            // its focus went stale while the Quit row had it instead;
+            // re-prime so it lands somewhere real again next frame,
+            // same as every other zone-closes-but-another-stays-open
+            // transition below.
+            if self.context_menu_open || self.rename_editor.is_some() || self.perm_editor.is_some()
+            {
+                self.focus_first_action = true;
+            }
+        } else if self.multi_select {
             self.multi_select = false;
             self.multi_selected.clear();
         } else if self.rename_editor.is_some() {
@@ -731,8 +740,10 @@ impl BrowDeckApp {
     /// produce an out-of-strip id — nothing left for this to correct in
     /// the steady state.
     fn enforce_strip_focus_guard(&mut self, ctx: &egui::Context) {
-        let guard_active =
-            self.context_menu_open || self.perm_editor.is_some() || self.rename_editor.is_some();
+        let guard_active = self.context_menu_open
+            || self.perm_editor.is_some()
+            || self.rename_editor.is_some()
+            || self.quit_confirm;
         if guard_active
             && !self.focus_inside_strip(ctx)
             && let Some(id) = self.right_last_focus
@@ -760,8 +771,10 @@ impl BrowDeckApp {
         // through a known list can't ever produce an out-of-strip id.
         // Left/Right step within the current row; Up/Down switch rows
         // (Actions <-> Permissions) while keeping roughly the same column.
-        let guard_active =
-            self.context_menu_open || self.perm_editor.is_some() || self.rename_editor.is_some();
+        let guard_active = self.context_menu_open
+            || self.perm_editor.is_some()
+            || self.rename_editor.is_some()
+            || self.quit_confirm;
         if guard_active {
             let inside = self.focus_inside_strip(ctx);
             if inside && !self.right_focus_rows.is_empty() {
@@ -904,7 +917,11 @@ impl BrowDeckApp {
         // Permissions, and/or Rename/New Folder is open. Progress alone
         // doesn't count: it's a plain display, nothing to interact with,
         // so no reason to trap focus there.
-        if self.context_menu_open || self.perm_editor.is_some() || self.rename_editor.is_some() {
+        if self.context_menu_open
+            || self.perm_editor.is_some()
+            || self.rename_editor.is_some()
+            || self.quit_confirm
+        {
             return;
         }
         let cycle = self.pane_cycle();
@@ -1181,41 +1198,65 @@ impl BrowDeckApp {
         &self.selected_info.as_ref().unwrap().1
     }
 
-    /// The Start-held-3s Quit confirmation — a centered modal whose
-    /// backdrop blocks all other input. Gamepad Left/Right/Activate/Back
-    /// are handled directly in the poll loop (see the `Quit` action arm),
-    /// bypassing the normal focus/pane system entirely so it can't leak
-    /// the way the Actions strip once did; the highlighted button here
-    /// just reflects that gamepad-tracked selection. Mouse clicks work
-    /// independently of it, same as any other button.
-    fn show_quit_confirm(&mut self, ctx: &egui::Context) {
-        egui::Modal::new(egui::Id::new("quit_confirm")).show(ctx, |ui| {
-            ui.set_width(220.0);
-            ui.vertical_centered(|ui| {
-                ui.label("Quit BrowDeck?");
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    let yes_fill = if self.quit_confirm_yes {
-                        egui::Color32::from_rgb(180, 60, 60)
-                    } else {
-                        egui::Color32::from_gray(70)
-                    };
-                    let cancel_fill = if self.quit_confirm_yes {
-                        egui::Color32::from_gray(70)
-                    } else {
-                        egui::Color32::from_gray(110)
-                    };
-                    let yes = ui.add(egui::Button::new("Yes").fill(yes_fill));
-                    let cancel = ui.add(egui::Button::new("Cancel").fill(cancel_fill));
-                    if yes.clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                    if cancel.clicked() {
-                        self.quit_confirm = false;
-                    }
-                });
-            });
+    /// The Start-held-3s Quit confirmation, rendered as a strip zone
+    /// (like Rename/Permissions) rather than a popup — a real
+    /// `egui::Modal` here (the previous approach) appeared to trigger
+    /// Steam Input's own desktop/mouse-mode remapping on real Deck
+    /// hardware, badly enough that gamepad input stayed broken until a
+    /// hard restart. A plain strip row is just ordinary `Panel` content,
+    /// like everything else here that's never had that problem. See
+    /// NOTES.md.
+    fn show_quit_zone(&mut self, ui: &mut egui::Ui) {
+        // Captured *before* Cancel's click handler below can set it —
+        // that sets it for the *next* frame's zone (Actions/Permissions,
+        // once this one's gone), not this one, same reasoning as
+        // `show_rename_editor`'s `focus_pending` local.
+        let focus_pending_at_start = self.focus_first_action;
+        let mut confirm = false;
+        let mut cancel = false;
+        let mut first_id = None;
+        let mut row_ids: Vec<egui::Id> = Vec::new();
+        ui.horizontal_wrapped(|ui| {
+            let close = Self::action_badge(self.badge_min_height(), ui, self.icon(ICON_CLOSE));
+            row_ids.push(close.id);
+            if close.clicked() {
+                cancel = true;
+            }
+            ui.strong("Quit BrowDeck?");
+            ui.separator();
+            let quit_btn = Self::action_badge(self.badge_min_height(), ui, "Quit");
+            row_ids.push(quit_btn.id);
+            if quit_btn.clicked() {
+                confirm = true;
+            }
+            let cancel_btn = Self::action_badge(self.badge_min_height(), ui, "Cancel");
+            // Defaults to Cancel, not Quit — unlike every other zone
+            // here, which auto-focuses its primary/confirm action first
+            // (e.g. Permissions' Apply). A stray Activate on this one
+            // closes the whole app, so the safe default matters more
+            // than the usual convenience.
+            first_id.get_or_insert(cancel_btn.id);
+            row_ids.push(cancel_btn.id);
+            if cancel_btn.clicked() {
+                cancel = true;
+            }
         });
+        self.right_focus_rows.push(row_ids);
+        if confirm {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if cancel {
+            self.quit_confirm = false;
+            // Same re-priming as the `escape()` path for this — see its
+            // comment.
+            if self.context_menu_open || self.rename_editor.is_some() || self.perm_editor.is_some()
+            {
+                self.focus_first_action = true;
+            }
+        }
+        if focus_pending_at_start && let Some(id) = first_id {
+            ui.ctx().memory_mut(|m| m.request_focus(id));
+            self.focus_first_action = false;
+        }
     }
 
     /// Persistent bottom bar: an always-visible gamepad button legend
@@ -1470,27 +1511,6 @@ impl eframe::App for BrowDeckApp {
             // and stick input feel responsive, not just event-driven.
             ui.ctx().request_repaint_after(Duration::from_millis(16));
             for action in actions {
-                // While the Quit dialog is up, it owns all gamepad input —
-                // handled entirely here, bypassing the normal focus/pane
-                // system, so there's no risk of it leaking into the file
-                // list the way the Actions strip once did.
-                if self.quit_confirm {
-                    match action {
-                        gamepad::Action::Move(egui::FocusDirection::Left)
-                        | gamepad::Action::Move(egui::FocusDirection::Right) => {
-                            self.quit_confirm_yes = !self.quit_confirm_yes;
-                        }
-                        gamepad::Action::Activate => {
-                            if self.quit_confirm_yes {
-                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                            }
-                            self.quit_confirm = false;
-                        }
-                        gamepad::Action::Back => self.quit_confirm = false,
-                        _ => {}
-                    }
-                    continue;
-                }
                 // While the Rename/New Folder text field has real
                 // keyboard focus, gamepad d-pad/left-stick input is
                 // swallowed instead of driving the normal strip
@@ -1510,7 +1530,7 @@ impl eframe::App for BrowDeckApp {
                 match action {
                     gamepad::Action::Quit => {
                         self.quit_confirm = true;
-                        self.quit_confirm_yes = false;
+                        self.focus_first_action = true;
                     }
                     gamepad::Action::Move(dir) => {
                         // egui's directional focus movement only works
@@ -1822,19 +1842,27 @@ impl eframe::App for BrowDeckApp {
             Rename,
             Permissions,
             Progress,
+            Quit,
         }
         let mut active_zones = Vec::new();
-        if show_actions {
-            active_zones.push(FooterZone::Actions);
-        }
-        if show_rename {
-            active_zones.push(FooterZone::Rename);
-        }
-        if show_permissions {
-            active_zones.push(FooterZone::Permissions);
-        }
-        if show_progress {
-            active_zones.push(FooterZone::Progress);
+        if self.quit_confirm {
+            // Exclusive — whatever else is open stays open underneath
+            // (just not rendered this frame), so canceling out of Quit
+            // doesn't lose it.
+            active_zones.push(FooterZone::Quit);
+        } else {
+            if show_actions {
+                active_zones.push(FooterZone::Actions);
+            }
+            if show_rename {
+                active_zones.push(FooterZone::Rename);
+            }
+            if show_permissions {
+                active_zones.push(FooterZone::Permissions);
+            }
+            if show_progress {
+                active_zones.push(FooterZone::Progress);
+            }
         }
         const STATUS_BAR_HEIGHT: f32 = 32.0;
         // Reserved height auto-fits the strip's *actual* content (see
@@ -1926,6 +1954,7 @@ impl eframe::App for BrowDeckApp {
                                     FooterZone::Rename => self.show_rename_editor(ui),
                                     FooterZone::Permissions => self.show_permission_editor(ui),
                                     FooterZone::Progress => self.show_progress_zone(ui),
+                                    FooterZone::Quit => self.show_quit_zone(ui),
                                 }
                             }
                             ui.add_space(1.0);
@@ -1974,10 +2003,6 @@ impl eframe::App for BrowDeckApp {
             }
         });
         self.central_rect = Some(central_resp.response.rect);
-
-        if self.quit_confirm {
-            self.show_quit_confirm(ui.ctx());
-        }
     }
 }
 

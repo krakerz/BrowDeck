@@ -35,7 +35,7 @@ and getting blurred.
 - Material Design icons; LT/RT adjusts the scale of the sidebar and main
   pane specifically (toolbar/strip/preview stay a fixed size)
 - CJK (Japanese/Chinese/Korean) filename rendering
-- Hold Start for 3s to quit, with a Yes/Cancel confirmation — no keyboard
+- Hold Start for 3s to quit, with a Quit/Cancel confirmation in the actions strip — no keyboard
   Alt+F4 to rely on under gamescope/Game Mode
 - Optional IProLaunch integration — an "Add to IProLaunch" action appears
   for `.exe`/`.bat` files when IProLaunch is installed
@@ -83,7 +83,7 @@ Navigate with the d-pad or left stick; the right stick moves the selection
 | L3        | Toggle multi-select                         |
 | R3        | Open the selected item                      |
 | Start (tap)  | Open the selected item                   |
-| Start (hold) | Quit (asks for Yes/Cancel confirmation)  |
+| Start (hold) | Quit (asks for confirmation in the actions strip)  |
 | Select    | Toggle preview pane width                   |
 | LB / RB   | Switch pane (Sidebar / main list / Preview / Toolbar) |
 | LT / RT   | Icon scale down / up                        |
