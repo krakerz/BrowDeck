@@ -1,5 +1,8 @@
 ## [Unreleased]
 
+### Changed
+- Relicensed from MIT to GPL-3.0-or-later
+
 ## [1.3.0] — 2026-09-08
 
 ### Added
