@@ -109,6 +109,16 @@ pub struct BrowDeckApp {
     /// Ids of last frame's toolbar buttons, in visual left-to-right order —
     /// confines d-pad/stick movement to the Toolbar pane.
     toolbar_ids: Vec<egui::Id>,
+    /// Last frame's Actions/Permissions strip widgets (badges, checkboxes),
+    /// one inner `Vec` per row (Actions row, then Permissions row, in that
+    /// order — whichever are actually open) in left-to-right order. Lets
+    /// d-pad/stick movement step through them by index instead of relying
+    /// on egui's geometric `move_focus`, which has no concept of the
+    /// strip's boundary and can walk focus into the file list behind it:
+    /// Left/Right step within the current row, Up/Down switch rows while
+    /// keeping roughly the same column (see `move_focus_confined`'s
+    /// guarded branch).
+    right_focus_rows: Vec<Vec<egui::Id>>,
     /// The last focused widget id seen in each pane, remembered so
     /// switching panes (LB/RB) restores the cursor to "where you left off"
     /// instead of landing nowhere.
@@ -149,6 +159,13 @@ pub struct BrowDeckApp {
     iprolaunch_bin: Option<PathBuf>,
     multi_select: bool,
     multi_selected: std::collections::HashSet<PathBuf>,
+    /// Gated by the `BROWDECK_DEBUG_FOCUS=1` env var — a standing
+    /// diagnostic channel for the gamepad-focus-guard bugs (kept around
+    /// across rounds instead of adding/removing `eprintln!`s each time, at
+    /// the user's request, 2026-09-08: "keep the log available, so you can
+    /// check it until i can say we can release it"). Remove this and its
+    /// call sites before release — see TODO.md.
+    debug_focus: bool,
 }
 
 /// How long a finished copy/move job stays visible before auto-closing.
@@ -196,6 +213,7 @@ impl BrowDeckApp {
             trash_ids: Vec::new(),
             sidebar_ids: Vec::new(),
             toolbar_ids: Vec::new(),
+            right_focus_rows: Vec::new(),
             sidebar_last_focus: None,
             active_last_focus: None,
             toolbar_last_focus: None,
@@ -209,6 +227,7 @@ impl BrowDeckApp {
             iprolaunch_bin: iprolaunch::detect_bin(),
             multi_select: false,
             multi_selected: std::collections::HashSet::new(),
+            debug_focus: std::env::var_os("BROWDECK_DEBUG_FOCUS").is_some(),
         };
         app.refresh();
         app
@@ -371,10 +390,25 @@ impl BrowDeckApp {
         if self.multi_select {
             self.multi_select = false;
             self.multi_selected.clear();
+        } else if self.perm_editor.is_some() {
+            // Permissions is opened *from* Actions (a sub-panel, never the
+            // other way around) so it's always the more-recently-opened of
+            // the two when both are up — B should close it first, leaving
+            // Actions, not the reverse. User report, 2026-09-08: "when we
+            // clicked the B, it's always close the new opened first
+            // (permission) then the previous one (action)". Closing the
+            // wrong one first also left the remaining strip looking
+            // dimmed/inactive (black background) — its focus was on a
+            // widget that belonged to the panel that just disappeared, so
+            // nothing in `right_focus_rows` matched it anymore; re-priming
+            // `focus_first_action` below whenever the strip stays open
+            // fixes that regardless of which order things close in.
+            self.perm_editor = None;
+            if self.context_menu_open {
+                self.focus_first_action = true;
+            }
         } else if self.context_menu_open {
             self.context_menu_open = false;
-        } else if self.perm_editor.is_some() {
-            self.perm_editor = None;
         } else if matches!(self.view, View::Trash) {
             self.view = View::Dir;
             self.set_selected(None);
@@ -448,6 +482,54 @@ impl BrowDeckApp {
         }
     }
 
+    /// Prints only when `BROWDECK_DEBUG_FOCUS=1` is set (see `debug_focus`)
+    /// — a standing channel for diagnosing the gamepad-focus-guard bugs,
+    /// left in place across rounds rather than added/removed each time.
+    /// Remove alongside `debug_focus` before release.
+    fn dbg_focus(&self, args: std::fmt::Arguments) {
+        if self.debug_focus {
+            eprintln!("[focus] {args}");
+        }
+    }
+
+    /// Whether focus is currently on a widget inside `actions_strip_rect`.
+    fn focus_inside_strip(&self, ctx: &egui::Context) -> bool {
+        ctx.memory(|m| m.focused())
+            .and_then(|id| ctx.read_response(id))
+            .is_some_and(|r| {
+                self.actions_strip_rect
+                    .is_some_and(|strip| strip.contains(r.rect.center()))
+            })
+    }
+
+    /// Called unconditionally at the top of every frame (not just reactively
+    /// inside a Move action) to catch focus starting outside the strip while
+    /// Actions and/or Permissions is open — e.g. the frame the strip first
+    /// opens, before `focus_first_action`'s `request_focus` has taken
+    /// effect, or if `ensure_focus_anchor` re-seeded focus into the file
+    /// list because nothing was focused that frame. Once focus is inside,
+    /// `move_focus_confined`'s guarded branch keeps it there deterministically
+    /// by index-stepping through `right_focus_rows` — it can't ever produce
+    /// an out-of-strip id, so there's nothing left for this to correct in
+    /// the steady state. (An earlier version of this guard tried to
+    /// synchronously validate `Memory::move_focus()`'s result instead, which
+    /// doesn't work: `move_focus()` only queues a `focus_direction`
+    /// resolved later in that same pass's `end_pass()`, so an immediately-
+    /// following check always read back the stale old focus. See NOTES.md,
+    /// 2026-09-08, for both rounds of this.)
+    fn enforce_strip_focus_guard(&mut self, ctx: &egui::Context) {
+        let guard_active = self.context_menu_open || self.perm_editor.is_some();
+        if guard_active && !self.focus_inside_strip(ctx)
+            && let Some(id) = self.right_last_focus
+        {
+            self.dbg_focus(format_args!(
+                "enforce: focus was outside strip (current={:?}), snapping to right_last_focus={id:?}",
+                ctx.memory(|m| m.focused())
+            ));
+            self.set_focus(ctx, id);
+        }
+    }
+
     /// Moves focus by one step within whichever pane currently has it,
     /// never letting a direction press leave that pane (that's LB/RB's
     /// job now, see [`Self::switch_pane`]). Sidebar/Active are vertical
@@ -458,47 +540,75 @@ impl BrowDeckApp {
     /// search — its contents are small/self-contained enough in practice
     /// that this hasn't been observed to leak into neighboring panes.
     fn move_focus_confined(&mut self, ctx: &egui::Context, dir: egui::FocusDirection) {
-        // While Actions and/or Permissions is open, *no* directional press
-        // should be able to reach another pane — not just ones already
-        // classified as Pane::Right (user request, 2026-09-08: "guard the
-        // dpad to go outside the widget"; Progress-only excluded, same as
-        // the LB/RB guard in `switch_pane`, since it's a plain display
-        // with nothing to focus). Checked *before* classifying the
-        // current pane at all: relying on "if the currently-focused pane
-        // is Right, stay confined" missed the much more common case where
-        // focus was somewhere else the moment the strip opened (or
-        // `ensure_focus_anchor` re-seeded it into the file list because
-        // nothing was focused that frame) — the very first press would
-        // then move selection in the file list while the strip stayed
-        // visually open, never triggering the old pane==Right check at
-        // all. Confirmed from the user's screenshot: file selection
-        // changed underneath an still-open Actions/Permissions strip.
+        // While Actions and/or Permissions is open, step through
+        // `right_focus_rows` by index instead of egui's geometric
+        // `move_focus` — geometric search has no concept of the strip's
+        // boundary, and letting it run (even guarded by an after-the-fact
+        // correction) still let focus visibly/interactably escape for a
+        // frame every time it searched off the end of the strip (e.g.
+        // pressing Left from the leftmost badge), since `move_focus` only
+        // *queues* a direction that resolves later in that pass's
+        // `end_pass()` — there's nothing to synchronously validate or
+        // revert. Index-stepping through a known list can't ever produce
+        // an out-of-strip id, so there's nothing to correct after the
+        // fact. User report, 2026-09-08: "we still can bypass to the
+        // active pane with left button" — confirmed the reactive
+        // after-the-fact approach (see `enforce_strip_focus_guard`, still
+        // kept as a fallback for focus starting outside the strip) wasn't
+        // enough on its own. Left/Right step within the current row;
+        // Up/Down switch rows (Actions <-> Permissions) while keeping
+        // roughly the same column — user follow-up, same day: Up/Down had
+        // been aliased to the same flat stepping as Left/Right, which
+        // didn't do anything row-aware.
         let guard_active = self.context_menu_open || self.perm_editor.is_some();
         if guard_active {
-            let currently_inside = |ctx: &egui::Context, this: &Self| {
-                ctx.memory(|m| m.focused())
-                    .and_then(|id| ctx.read_response(id))
-                    .is_some_and(|r| {
-                        this.actions_strip_rect
-                            .is_some_and(|strip| strip.contains(r.rect.center()))
+            let inside = self.focus_inside_strip(ctx);
+            self.dbg_focus(format_args!(
+                "move_focus_confined: guard_active dir={dir:?} current={:?} inside={inside} rows={:?}",
+                ctx.memory(|m| m.focused()),
+                self.right_focus_rows
+            ));
+            if inside && !self.right_focus_rows.is_empty() {
+                let current = ctx.memory(|m| m.focused());
+                let pos = current.and_then(|id| {
+                    self.right_focus_rows.iter().enumerate().find_map(|(r, row)| {
+                        row.iter().position(|i| *i == id).map(|c| (r, c))
                     })
-            };
-            if !currently_inside(ctx, self) {
-                // Focus isn't (or is no longer) inside the strip — snap it
-                // back to the last widget known to be there rather than
-                // trying to reason about where a geometric search from the
-                // wrong anchor would land.
-                if let Some(id) = self.right_last_focus {
+                });
+                let next_id = match dir {
+                    egui::FocusDirection::Left | egui::FocusDirection::Right => {
+                        let delta: isize = if dir == egui::FocusDirection::Right { 1 } else { -1 };
+                        match pos {
+                            Some((r, c)) => {
+                                let row = &self.right_focus_rows[r];
+                                let next_c = (c as isize + delta)
+                                    .clamp(0, row.len().saturating_sub(1) as isize)
+                                    as usize;
+                                row.get(next_c).copied()
+                            }
+                            None => self.right_focus_rows.first().and_then(|row| row.first()).copied(),
+                        }
+                    }
+                    egui::FocusDirection::Up | egui::FocusDirection::Down => {
+                        let delta: isize = if dir == egui::FocusDirection::Down { 1 } else { -1 };
+                        match pos {
+                            Some((r, c)) => {
+                                let next_r = (r as isize + delta)
+                                    .clamp(0, self.right_focus_rows.len().saturating_sub(1) as isize)
+                                    as usize;
+                                let target_row = &self.right_focus_rows[next_r];
+                                let next_c = c.min(target_row.len().saturating_sub(1));
+                                target_row.get(next_c).copied()
+                            }
+                            None => self.right_focus_rows.first().and_then(|row| row.first()).copied(),
+                        }
+                    }
+                    _ => None,
+                };
+                self.dbg_focus(format_args!("move_focus_confined: pos={pos:?} -> next_id={next_id:?}"));
+                if let Some(id) = next_id {
                     self.set_focus(ctx, id);
                 }
-                return;
-            }
-            let before = ctx.memory(|m| m.focused());
-            ctx.memory_mut(|m| m.move_focus(dir));
-            if !currently_inside(ctx, self)
-                && let Some(id) = before
-            {
-                ctx.memory_mut(|m| m.request_focus(id));
             }
             return;
         }
@@ -724,12 +834,33 @@ impl BrowDeckApp {
     /// "make the style like the bottom bar") instead of a heavier-looking
     /// separate widget.
     fn action_badge<'a>(ui: &mut egui::Ui, content: impl egui::IntoAtoms<'a>) -> egui::Response {
-        ui.add(
-            egui::Button::new(content)
-                .small()
-                .corner_radius(4.0)
-                .fill(egui::Color32::from_gray(70)),
-        )
+        // Scoped so it doesn't bleed into anything else drawn after this
+        // badge. egui's `Style::button_style()` computes a button's
+        // `inner_margin` as `button_padding + expansion - bg_stroke.width`
+        // — the default *inactive* `bg_stroke` has width 0, but *hovered*
+        // and *active* (keyboard focus counts as `active`, see
+        // `Response::widget_state`) both use width 1.0. That difference
+        // feeds straight into the button's own allocated size, so a badge
+        // visibly shrinks/grows by ~2px on each axis the instant it gains
+        // or loses focus — shifting every badge after it in the row. Fixed
+        // by giving `inactive` a same-width but *transparent* stroke, so
+        // the reserved size is identical across states and only the color
+        // (visibly no border vs. a real one) changes. User diagnosis,
+        // 2026-09-08: "you render additional border (for highlight)... so
+        // it's slightly adjust the padding" — confirmed by reading
+        // `button_style()`/`WidgetVisuals` in egui's own source.
+        ui.scope(|ui| {
+            let width = ui.visuals().widgets.hovered.bg_stroke.width;
+            ui.visuals_mut().widgets.inactive.bg_stroke =
+                egui::Stroke::new(width, egui::Color32::TRANSPARENT);
+            ui.add(
+                egui::Button::new(content)
+                    .small()
+                    .corner_radius(4.0)
+                    .fill(egui::Color32::from_gray(70)),
+            )
+        })
+        .inner
     }
 
     /// Persistent bottom bar: an always-visible gamepad button legend
@@ -899,6 +1030,7 @@ impl eframe::App for BrowDeckApp {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
 
+        self.enforce_strip_focus_guard(ui.ctx());
         let focused_pane = self.focused_pane(ui.ctx());
         // Reset every frame — only set again below if the right stick is
         // actually tilted past the deadzone this frame.
@@ -1211,6 +1343,7 @@ impl eframe::App for BrowDeckApp {
                         .max_height(strip_height)
                         .show(&mut strip_ui, |ui| {
                             self.apply_pending_scroll(ui, Pane::Right);
+                            self.right_focus_rows.clear();
                             for zone in &active_zones {
                                 match zone {
                                     FooterZone::Actions => self.show_actions_zone(ui),
@@ -1594,8 +1727,11 @@ impl BrowDeckApp {
         let paths = self.selected_paths();
         let single = (paths.len() == 1).then(|| paths[0].clone());
         let mut first_id = None;
+        let mut row_ids: Vec<egui::Id> = Vec::new();
         ui.horizontal_wrapped(|ui| {
-            if Self::action_badge(ui, self.icon(ICON_CLOSE)).clicked() {
+            let close = Self::action_badge(ui, self.icon(ICON_CLOSE));
+            row_ids.push(close.id);
+            if close.clicked() {
                 self.context_menu_open = false;
             }
             ui.strong("Actions");
@@ -1612,6 +1748,7 @@ impl BrowDeckApp {
             if self.clipboard.is_some() && self.jobs.is_empty() {
                 let r = Self::action_badge(ui, (self.icon(ICON_CONTENT_PASTE), "Paste"));
                 first_id.get_or_insert(r.id);
+                row_ids.push(r.id);
                 if r.clicked() {
                     self.paste();
                     // Deliberately left open: the copy/move progress zone
@@ -1623,6 +1760,7 @@ impl BrowDeckApp {
             {
                 let r = Self::action_badge(ui, (self.icon(ICON_OPEN_IN_NEW), "Open"));
                 first_id.get_or_insert(r.id);
+                row_ids.push(r.id);
                 if r.clicked() {
                     self.open_selected();
                     self.context_menu_open = false;
@@ -1631,6 +1769,7 @@ impl BrowDeckApp {
             if !paths.is_empty() {
                 let r = Self::action_badge(ui, (self.icon(ICON_CONTENT_COPY), "Copy"));
                 first_id.get_or_insert(r.id);
+                row_ids.push(r.id);
                 if r.clicked() {
                     self.clipboard = Some(Clipboard {
                         paths: paths.clone(),
@@ -1640,6 +1779,7 @@ impl BrowDeckApp {
                 }
                 let r = Self::action_badge(ui, (self.icon(ICON_CONTENT_CUT), "Cut"));
                 first_id.get_or_insert(r.id);
+                row_ids.push(r.id);
                 if r.clicked() {
                     self.clipboard = Some(Clipboard {
                         paths: paths.clone(),
@@ -1649,6 +1789,7 @@ impl BrowDeckApp {
                 }
                 let r = Self::action_badge(ui, (self.icon(ICON_DELETE), "Delete"));
                 first_id.get_or_insert(r.id);
+                row_ids.push(r.id);
                 if r.clicked() {
                     self.delete_paths(&paths);
                     self.context_menu_open = false;
@@ -1660,6 +1801,7 @@ impl BrowDeckApp {
             {
                 let r = Self::action_badge(ui, (self.icon(ICON_UNARCHIVE), "Extract"));
                 first_id.get_or_insert(r.id);
+                row_ids.push(r.id);
                 if r.clicked() {
                     let dest_dir = self.current_dir.clone();
                     self.jobs
@@ -1671,6 +1813,7 @@ impl BrowDeckApp {
             if let Some(path) = &single {
                 let r = Self::action_badge(ui, (self.icon(ICON_LOCK), "Permissions"));
                 first_id.get_or_insert(r.id);
+                row_ids.push(r.id);
                 if r.clicked()
                     && let Some(mode) = permissions::read_mode(path)
                 {
@@ -1689,6 +1832,7 @@ impl BrowDeckApp {
             {
                 let r = Self::action_badge(ui, (self.icon(ICON_ROCKET_LAUNCH), "IProLaunch"));
                 first_id.get_or_insert(r.id);
+                row_ids.push(r.id);
                 if r.clicked()
                     && let Err(e) = iprolaunch::add(bin, path)
                 {
@@ -1696,6 +1840,7 @@ impl BrowDeckApp {
                 }
             }
         });
+        self.right_focus_rows.push(row_ids);
         if self.focus_first_action
             && let Some(id) = first_id
         {
@@ -1706,8 +1851,11 @@ impl BrowDeckApp {
 
     fn show_trash_actions(&mut self, ui: &mut egui::Ui) {
         let mut first_id = None;
+        let mut row_ids: Vec<egui::Id> = Vec::new();
         ui.horizontal_wrapped(|ui| {
-            if Self::action_badge(ui, self.icon(ICON_CLOSE)).clicked() {
+            let close = Self::action_badge(ui, self.icon(ICON_CLOSE));
+            row_ids.push(close.id);
+            if close.clicked() {
                 self.context_menu_open = false;
             }
             ui.strong("Actions");
@@ -1715,6 +1863,7 @@ impl BrowDeckApp {
             if let Some(i) = self.selected_trash {
                 let r = Self::action_badge(ui, (self.icon(ICON_RESTORE_FROM_TRASH), "Restore"));
                 first_id.get_or_insert(r.id);
+                row_ids.push(r.id);
                 if r.clicked() {
                     if let Err(e) = deleted::restore(&self.trash_entries[i]) {
                         eprintln!("restore failed: {e}");
@@ -1727,6 +1876,7 @@ impl BrowDeckApp {
             if !self.trash_entries.is_empty() {
                 let r = Self::action_badge(ui, (self.icon(ICON_DELETE_SWEEP), "Empty All"));
                 first_id.get_or_insert(r.id);
+                row_ids.push(r.id);
                 if r.clicked() {
                     if let Err(e) = deleted::empty_all() {
                         eprintln!("empty trash failed: {e}");
@@ -1737,6 +1887,7 @@ impl BrowDeckApp {
                 }
             }
         });
+        self.right_focus_rows.push(row_ids);
         if self.focus_first_action
             && let Some(id) = first_id
         {
@@ -1754,8 +1905,10 @@ impl BrowDeckApp {
         let mut mode = editor.mode;
         let path = editor.path.clone();
         let mut first_id = None;
+        let mut row_ids: Vec<egui::Id> = Vec::new();
         ui.horizontal_wrapped(|ui| {
             let close = Self::action_badge(ui, self.icon(ICON_CLOSE));
+            row_ids.push(close.id);
             if close.clicked() {
                 cancel = true;
             }
@@ -1771,7 +1924,9 @@ impl BrowDeckApp {
                 for (bit, letter) in [(0o4u32, "R"), (0o2, "W"), (0o1, "X")] {
                     let mask = bit << shift;
                     let mut checked = mode & mask != 0;
-                    if ui.checkbox(&mut checked, letter).changed() {
+                    let cb = ui.checkbox(&mut checked, letter);
+                    row_ids.push(cb.id);
+                    if cb.changed() {
                         if checked {
                             mode |= mask;
                         } else {
@@ -1783,13 +1938,17 @@ impl BrowDeckApp {
             ui.separator();
             let apply_btn = Self::action_badge(ui, "Apply");
             first_id.get_or_insert(apply_btn.id);
+            row_ids.push(apply_btn.id);
             if apply_btn.clicked() {
                 apply = true;
             }
-            if Self::action_badge(ui, "Cancel").clicked() {
+            let cancel_btn = Self::action_badge(ui, "Cancel");
+            row_ids.push(cancel_btn.id);
+            if cancel_btn.clicked() {
                 cancel = true;
             }
         });
+        self.right_focus_rows.push(row_ids);
         if apply {
             if let Err(e) = permissions::set_mode(&path, mode) {
                 eprintln!("chmod failed: {e}");
