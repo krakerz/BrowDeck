@@ -960,10 +960,45 @@ impl BrowDeckApp {
 
     /// Gamepad R3 and the actions panel's "Open" button.
     fn open_selected(&mut self) {
-        if let Some(path) = self.selected.clone()
-            && !path.is_dir()
-            && let Err(e) = open::that(&path)
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        if path.is_dir() {
+            return;
+        }
+        // `.exe`/`.bat` go through IProLaunch directly (`<bin> run
+        // <path>`) when it's available — a freshly-extracted `.exe`
+        // usually doesn't have the exec bit set, so it wouldn't take the
+        // direct-spawn path below, and `open::that()`/the desktop
+        // portal's OpenURI can't run it either way (see below). Falls
+        // through to the exec-bit/open::that() handling otherwise.
+        if iprolaunch::is_launchable(&path)
+            && let Some(bin) = self.iprolaunch_bin.clone()
         {
+            if let Err(e) = iprolaunch::run(&bin, &path) {
+                eprintln!("iprolaunch run failed: {e}");
+            }
+            return;
+        }
+        // Executable files (the exec bit set) are spawned directly
+        // instead of through `open::that()`. On Linux that shells out to
+        // `xdg-open`/the desktop portal's OpenURI, and modern portal
+        // backends refuse to launch anything with the exec bit set as a
+        // security measure — silently, from BrowDeck's perspective: the
+        // portal client pops its own "not allowed in this context"
+        // dialog rather than returning an error `open::that()` can see,
+        // so this doesn't even show up as an `open failed` line. A
+        // direct `spawn()` matches normal double-click-to-run semantics
+        // and bypasses the portal entirely.
+        use std::os::unix::fs::PermissionsExt;
+        let is_executable =
+            std::fs::metadata(&path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0);
+        let result = if is_executable {
+            std::process::Command::new(&path).spawn().map(|_| ())
+        } else {
+            open::that(&path)
+        };
+        if let Err(e) = result {
             eprintln!("open failed: {e}");
         }
     }
