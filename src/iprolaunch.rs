@@ -34,6 +34,15 @@ pub fn add(bin: &Path, target: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Launches `target` through IProLaunch (via Proton/wine): `<bin> run
+/// <target>`. Bypasses `xdg-open`/the desktop portal entirely — the
+/// portal refuses to launch anything with the exec bit set, and a
+/// freshly-extracted `.exe` usually doesn't have it set anyway.
+pub fn run(bin: &Path, target: &Path) -> std::io::Result<()> {
+    Command::new(bin).arg("run").arg(target).spawn()?;
+    Ok(())
+}
+
 /// Whether `target` is already a registered library profile: runs
 /// `<bin> library search <target>` and checks whether any returned
 /// profile's path is *exactly* `target` — search itself is a

@@ -26,6 +26,10 @@
 - Action badges visibly shifted size when gaining/losing focus
 - Right-stick scroll could stop entirely once the focused row scrolled
   off-screen
+- Opening an executable script could fail with a desktop-portal security
+  dialog instead of running
+- Opening an `.exe`/`.bat` now launches it through IProLaunch directly
+  when available, instead of going through the desktop portal at all
 
 ## [1.0.0] — 2026-09-08
 
