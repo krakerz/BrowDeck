@@ -307,22 +307,40 @@ pub struct BrowDeckApp {
     /// succeeds; every "what pane are we in" decision reads this instead
     /// of calling `focused_pane()` directly.
     current_pane: Option<Pane>,
-    /// True while the Start-held-3s Quit confirmation is showing — a
-    /// strip zone (`FooterZone::Quit`) like Rename/Permissions, not a
-    /// popup (see NOTES.md "quit confirmation modal broke gamepad
-    /// input" for why a real `egui::Modal` isn't used here).
+    /// True while the R3 Quit confirmation is showing — a strip zone
+    /// (`FooterZone::Quit`) like Rename/Permissions, not a popup (see
+    /// NOTES.md "quit confirmation modal broke gamepad input" for why a
+    /// real `egui::Modal` isn't used here). A plain R3 press, not held —
+    /// and not Start at all, which turned out to break gamepad input on
+    /// its own regardless of hold duration or how the confirmation was
+    /// rendered (see NOTES.md "holding Start itself breaks gamepad
+    /// input").
     quit_confirm: bool,
     /// Whether the title header above the toolbar shows — from
     /// `config.toml`'s `show_header`, fixed for the life of the app (no
     /// in-app toggle, unlike `show_hidden_files`/`show_all_mounts`).
     show_header: bool,
+    /// Countdown of frames left to re-send `ViewportCommand::InnerSize`
+    /// with `config.toml`'s width/height (windowed mode only) — see
+    /// `reassert_window_size`'s doc comment for why this exists at all.
+    resize_reassert_frames_left: u8,
+    /// The windowed-mode size to keep re-asserting while
+    /// `resize_reassert_frames_left` counts down — `None` when
+    /// `fullscreen = true`, since there's nothing to reassert then.
+    config_windowed_size: Option<egui::Vec2>,
 }
 
 /// How long a finished copy/move job stays visible before auto-closing.
 const JOB_LINGER: Duration = Duration::from_secs(2);
 
 impl BrowDeckApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, show_header: bool) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        show_header: bool,
+        fullscreen: bool,
+        config_width: f32,
+        config_height: f32,
+    ) -> Self {
         egui_material_icons::initialize(&cc.egui_ctx);
         egui_extras::install_image_loaders(&cc.egui_ctx);
         fonts::install_cjk_fallback(&cc.egui_ctx);
@@ -393,14 +411,42 @@ impl BrowDeckApp {
             current_pane: None,
             quit_confirm: false,
             show_header,
+            // See `reassert_window_size`'s doc comment — ~30 frames
+            // (roughly half a second) of retries, generous enough to
+            // survive whatever timing race causes the compositor to
+            // miss the first one, without retrying forever.
+            resize_reassert_frames_left: if fullscreen { 0 } else { 30 },
+            config_windowed_size: (!fullscreen).then_some(egui::vec2(config_width, config_height)),
         };
         app.refresh();
         app
     }
 
-    /// Renders a [`MaterialIcon`] at the current icon scale — use this
-    /// instead of a bare `ICON_*` constant everywhere in the UI so the
-    /// zoom +/- controls affect every icon consistently.
+    /// Re-sends `ViewportCommand::InnerSize` with the configured windowed
+    /// size for the first several frames after launch — belt-and-
+    /// suspenders alongside `main.rs`'s `with_inner_size` viewport hint.
+    /// Reported on real Steam Deck hardware (gamescope's *nested*
+    /// Xwayland, windowed/`fullscreen = false` in `config.toml`): despite
+    /// that hint, layout still ended up narrower than the configured
+    /// width — the status bar's legend, which fits comfortably in this
+    /// same windowed setup on a desktop KWin session, was still cut off.
+    /// Never reproduced locally (no gamescope here), so this is the
+    /// standard workaround for "a compositor doesn't honor the size
+    /// requested at window-creation time" — explicitly re-requesting the
+    /// size *after* the window already exists, which terminal emulators
+    /// like Alacritty do for the same class of issue — rather than a
+    /// confirmed root cause. A no-op once `fullscreen = true` (nothing to
+    /// reassert) or after the retry budget runs out.
+    fn reassert_window_size(&mut self, ctx: &egui::Context) {
+        if self.resize_reassert_frames_left == 0 {
+            return;
+        }
+        if let Some(size) = self.config_windowed_size {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        }
+        self.resize_reassert_frames_left -= 1;
+    }
+
     /// Fixed-size icon, ignoring `icon_scale` — the toolbar, Preview, and
     /// Actions/Permissions/Rename/Progress strip all use this so LT/RT
     /// zoom doesn't change their size; see `icon_scaled` for the handful
@@ -1198,14 +1244,19 @@ impl BrowDeckApp {
         &self.selected_info.as_ref().unwrap().1
     }
 
-    /// The Start-held-3s Quit confirmation, rendered as a strip zone
-    /// (like Rename/Permissions) rather than a popup — a real
-    /// `egui::Modal` here (the previous approach) appeared to trigger
-    /// Steam Input's own desktop/mouse-mode remapping on real Deck
-    /// hardware, badly enough that gamepad input stayed broken until a
-    /// hard restart. A plain strip row is just ordinary `Panel` content,
-    /// like everything else here that's never had that problem. See
-    /// NOTES.md.
+    /// The R3 Quit confirmation, rendered as a strip zone (like Rename/
+    /// Permissions) rather than a popup — a real `egui::Modal` here (the
+    /// original approach, triggered by holding Start rather than a plain
+    /// R3 press) was suspected of triggering Steam Input's own desktop/
+    /// mouse-mode remapping on real Deck hardware, badly enough that
+    /// gamepad input stayed broken until a hard restart. Turned out to
+    /// actually be *holding Start itself* that Steam Input reacts to,
+    /// regardless of what BrowDeck does in response — see NOTES.md
+    /// "holding Start itself breaks gamepad input" — so the trigger
+    /// moved to a plain R3 press entirely (no hold, no timer — the
+    /// Quit/Cancel row itself is the confirmation step). Kept as a strip
+    /// row anyway (rather than reverting to a Modal) since it's simpler
+    /// and consistent with every other confirmation zone here.
     fn show_quit_zone(&mut self, ui: &mut egui::Ui) {
         // Captured *before* Cancel's click handler below can set it —
         // that sets it for the *next* frame's zone (Actions/Permissions,
@@ -1323,8 +1374,10 @@ impl BrowDeckApp {
             ui.label("Zoom");
             Self::key_badge(ui, "L3");
             ui.label("Multi-select");
-            Self::key_badge(ui, "R3/Start");
+            Self::key_badge(ui, "Start");
             ui.label("Open");
+            Self::key_badge(ui, "R3");
+            ui.label("Quit");
             Self::key_badge(ui, "Select");
             ui.label("Preview width");
             if self.multi_select {
@@ -1456,6 +1509,7 @@ impl BrowDeckApp {
 
 impl eframe::App for BrowDeckApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.reassert_window_size(ui.ctx());
         let previously_unfinished: Vec<bool> = self.jobs.iter().map(|j| !j.finished).collect();
         for job in &mut self.jobs {
             job.poll();

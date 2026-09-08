@@ -9,9 +9,9 @@ A gamepad-first file browser for Linux, built for Steam gamemode / gamescope.
 Most file browsers assume a mouse and keyboard. BrowDeck doesn't — every
 action (navigate, select, copy/cut/delete, extract, change permissions) is
 reachable from a controller alone, with no nested right-click menus.
-Fullscreen by default at the display's native resolution, so it behaves
-correctly under gamescope instead of rendering at some fallback resolution
-and getting blurred.
+Windowed at 1280x800 (the Steam Deck LCD's native resolution) by default —
+confirmed the reliable combination under gamescope on real hardware;
+borderless fullscreen is available too via `config.toml`.
 
 ## Features
 
@@ -35,8 +35,8 @@ and getting blurred.
 - Material Design icons; LT/RT adjusts the scale of the sidebar and main
   pane specifically (toolbar/strip/preview stay a fixed size)
 - CJK (Japanese/Chinese/Korean) filename rendering
-- Hold Start for 3s to quit, with a Quit/Cancel confirmation in the actions strip — no keyboard
-  Alt+F4 to rely on under gamescope/Game Mode
+- R3 to quit, with a Quit/Cancel confirmation in the actions strip — no
+  keyboard Alt+F4 to rely on under gamescope/Game Mode
 - Optional IProLaunch integration — an "Add to IProLaunch" action appears
   for `.exe`/`.bat` files when IProLaunch is installed
 
@@ -62,11 +62,11 @@ cargo build --release
 
 BrowDeck writes `$XDG_CONFIG_HOME/browdeck/config.toml` (falling back to
 `~/.config/browdeck/config.toml`) itself the first time it runs with none
-present, with sane defaults already set — fullscreen at the display's
-native resolution, and a thin title header above the toolbar (there to
-keep the toolbar's icons clear of Steam/gamescope's own performance
-overlay) both on. Edit it to go windowed, change the resolution, or turn
-the header off; see `config/config.example.toml` for every available key.
+present, with sane defaults already set — windowed at 1280x800, and a
+thin title header above the toolbar (there to keep the toolbar's icons
+clear of Steam/gamescope's own performance overlay) on. Edit it to go
+fullscreen, change the resolution, or turn the header off; see
+`config/config.example.toml` for every available key.
 
 ## Usage
 
@@ -81,9 +81,8 @@ Navigate with the d-pad or left stick; the right stick moves the selection
 | Y (tap)   | Refresh the active pane                     |
 | Y (hold)  | Search                                      |
 | L3        | Toggle multi-select                         |
-| R3        | Open the selected item                      |
-| Start (tap)  | Open the selected item                   |
-| Start (hold) | Quit (asks for confirmation in the actions strip)  |
+| R3        | Quit (asks for confirmation in the actions strip) |
+| Start     | Open the selected item                      |
 | Select    | Toggle preview pane width                   |
 | LB / RB   | Switch pane (Sidebar / main list / Preview / Toolbar) |
 | LT / RT   | Icon scale down / up                        |
@@ -92,10 +91,12 @@ Everything is also reachable with a mouse and keyboard.
 
 ## FAQ
 
-**Why fullscreen by default?**
-Because rendering at a fallback resolution and letting the compositor
-upscale/blur the result is the exact gamescope behavior this project exists
-to avoid.
+**Why windowed by default, not fullscreen?**
+Both work, but windowed at the Deck's native resolution (1280x800) is what
+real Steam Deck testing confirmed reliable under gamescope's nested
+Xwayland — fullscreen's own cold-launch sizing negotiation hasn't been
+confirmed the same way on real hardware. Set `fullscreen = true` in
+`config.toml` if you'd rather have borderless fullscreen.
 
 **Does it work without a gamepad?**
 Yes — mouse and keyboard work throughout. The status bar's button legend

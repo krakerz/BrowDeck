@@ -38,6 +38,14 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "BrowDeck",
         options,
-        Box::new(move |cc| Ok(Box::new(app::BrowDeckApp::new(cc, config.show_header)))),
+        Box::new(move |cc| {
+            Ok(Box::new(app::BrowDeckApp::new(
+                cc,
+                config.show_header,
+                config.fullscreen,
+                config.width as f32,
+                config.height as f32,
+            )))
+        }),
     )
 }

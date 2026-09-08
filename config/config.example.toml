@@ -7,10 +7,11 @@
 # optional, anything left out, or the whole file being absent, falls back
 # to the default shown here.
 
-# Launch fullscreen at the display's native resolution. This is the intended
-# mode for gamescope / Steam Game Mode. Set to false to launch in a resizable
-# window instead (useful for testing on a desktop).
-#fullscreen = true
+# Launch fullscreen at the display's native resolution, instead of the
+# windowed default below. Borderless fullscreen is the intended mode for
+# gamescope / Steam Game Mode in principle, but windowed (at the size
+# below) is what's confirmed reliable on real Steam Deck hardware.
+#fullscreen = false
 
 # Thin title header above the toolbar, there to keep the toolbar's own
 # icons clear of Steam/gamescope's performance overlay. Set to false to
@@ -19,5 +20,6 @@
 #show_header = true
 
 # Window size when fullscreen = false. Ignored while fullscreen = true.
+# 1280x800 is the Steam Deck LCD's native resolution.
 #width = 1280
 #height = 800

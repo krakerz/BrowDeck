@@ -9,8 +9,6 @@ const REPEAT_INTERVAL: Duration = Duration::from_millis(120);
 const STICK_THRESHOLD: f32 = 0.5;
 /// How long Y must be held before it opens Search instead of Refresh.
 const SEARCH_HOLD: Duration = Duration::from_secs(3);
-/// How long Start must be held before it asks to quit instead of opening.
-const QUIT_HOLD: Duration = Duration::from_secs(3);
 
 pub enum Action {
     Move(egui::FocusDirection),
@@ -41,14 +39,20 @@ pub enum Action {
     Search,
     ScaleDown,
     ScaleUp,
-    /// Start tap (< 3s)/R3 — open the selected file directly, bypassing
-    /// the actions panel.
+    /// Start — open the selected file directly, bypassing the actions
+    /// panel. Deliberately the *only* thing Start does — holding it was
+    /// tried for `Quit` and turned out to trigger Steam Input's own
+    /// mouse/gamepad-mode remapping regardless of what BrowDeck does in
+    /// response, so Start can't be repurposed for anything beyond a
+    /// plain tap.
     Open,
     /// Right stick — continuous scroll, sent every frame it's tilted past
     /// the deadzone (magnitude/direction, not an edge-triggered move).
     Scroll(f32),
-    /// Start held 3s — asks for confirmation before closing the app (no
-    /// keyboard Alt+F4 to rely on under gamescope/Game Mode).
+    /// R3 — asks for confirmation before closing the app (no keyboard
+    /// Alt+F4 to rely on under gamescope/Game Mode). A plain press, not
+    /// held — the confirmation strip it opens (Quit/Cancel) is already
+    /// the safety gate, no separate hold timer needed on top of it.
     Quit,
 }
 
@@ -62,8 +66,6 @@ pub struct GamepadInput {
     left_stick_direction: Option<egui::FocusDirection>,
     north_pressed_at: Option<Instant>,
     north_hold_fired: bool,
-    start_pressed_at: Option<Instant>,
-    start_hold_fired: bool,
 }
 
 impl GamepadInput {
@@ -79,8 +81,6 @@ impl GamepadInput {
                 left_stick_direction: None,
                 north_pressed_at: None,
                 north_hold_fired: false,
-                start_pressed_at: None,
-                start_hold_fired: false,
             }),
             Err(e) => {
                 eprintln!("gamepad input unavailable: {e}");
@@ -110,18 +110,6 @@ impl GamepadInput {
                         && pressed_at.elapsed() < SEARCH_HOLD
                     {
                         actions.push(Action::Refresh);
-                    }
-                }
-                EventType::ButtonPressed(Button::Start, _) => {
-                    self.start_pressed_at = Some(Instant::now());
-                    self.start_hold_fired = false;
-                }
-                EventType::ButtonReleased(Button::Start, _) => {
-                    if let Some(pressed_at) = self.start_pressed_at.take()
-                        && !self.start_hold_fired
-                        && pressed_at.elapsed() < QUIT_HOLD
-                    {
-                        actions.push(Action::Open);
                     }
                 }
                 EventType::ButtonPressed(button, _) => {
@@ -157,13 +145,6 @@ impl GamepadInput {
         {
             actions.push(Action::Search);
             self.north_hold_fired = true;
-        }
-        if let Some(pressed_at) = self.start_pressed_at
-            && !self.start_hold_fired
-            && pressed_at.elapsed() >= QUIT_HOLD
-        {
-            actions.push(Action::Quit);
-            self.start_hold_fired = true;
         }
         actions
     }
@@ -217,13 +198,14 @@ fn action_for(button: Button) -> Option<Action> {
         Button::South => Some(Action::Activate),
         Button::East => Some(Action::Back),
         Button::West => Some(Action::ContextMenu),
+        Button::Start => Some(Action::Open),
         Button::Select => Some(Action::TogglePreviewWidth),
         Button::LeftTrigger => Some(Action::SwapPaneLeft),
         Button::RightTrigger => Some(Action::SwapPaneRight),
         Button::LeftTrigger2 => Some(Action::ScaleDown),
         Button::RightTrigger2 => Some(Action::ScaleUp),
         Button::LeftThumb => Some(Action::ToggleMultiSelect),
-        Button::RightThumb => Some(Action::Open),
+        Button::RightThumb => Some(Action::Quit),
         _ => None,
     }
 }
