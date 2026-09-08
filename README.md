@@ -122,3 +122,5 @@ shows a checkmark and is disabled instead.
 ### Notes
 
 Built and maintained with the help of AI.
+
+Licensed under [GPL-3.0-or-later](LICENSE).
