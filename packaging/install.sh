@@ -18,8 +18,18 @@ fi
 mkdir -p "$bin_dir" "$apps_dir" "$icon_dir" "$config_dir"
 
 install -m 755 "$dir/browdeck" "$bin_dir/browdeck"
-install -m 644 "$dir/browdeck.desktop" "$apps_dir/browdeck.desktop"
 install -m 644 "$dir/icon.png" "$icon_dir/browdeck.png"
+
+# The shipped .desktop's `Exec=browdeck` relies on `$bin_dir` being on
+# $PATH, which desktop-session/launcher processes (KDE's app launcher,
+# Steam's own launch) don't reliably inherit — confirmed broken on Steam
+# Deck. Rewrite Exec/Icon to the absolute installed paths instead, so it
+# works regardless of $PATH.
+sed \
+    -e "s|^Exec=.*|Exec=$bin_dir/browdeck|" \
+    -e "s|^Icon=.*|Icon=$icon_dir/browdeck.png|" \
+    "$dir/browdeck.desktop" > "$apps_dir/browdeck.desktop"
+chmod 644 "$apps_dir/browdeck.desktop"
 
 # Copied as .example, never overwriting a real config.toml — see
 # config.example.toml's own comments for how to use it.

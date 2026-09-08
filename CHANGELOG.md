@@ -1,5 +1,96 @@
 ## [Unreleased]
 
+## [1.3.0] — 2026-09-08
+
+### Added
+- `config.toml` is now generated automatically on first launch (fullscreen
+  and the header both explicitly enabled), instead of only existing if a
+  user copies the example file in themselves
+- The title header can be turned off via `show_header = false` in
+  `config.toml`
+- README screenshot
+
+### Changed
+- The bottom status bar (gamepad button legend)'s content is now centered
+  as a group instead of left-aligned, with the version tucked in its own
+  spot on the right — it was getting cut off at narrower/windowed sizes
+  with no way to see the rest
+- The button legend always shows, even with no gamepad connected, so it
+  also documents the mouse/keyboard equivalents
+- Trimmed a couple of legend labels ("Back/Up dir" → "Back", "Refresh
+  (hold: Search)" → "Refresh (Search)") to leave more room
+- Status bar is a bit shorter
+- A/B/X/Y face-button badges are drawn as true circles (fixed diameter,
+  painted directly), matching real controller buttons, instead of a
+  rounded-rectangle guess that came out oval
+- Actions/Permissions/Rename strip badges are now a uniform height
+  whether or not they have an icon — a text-only badge ("Cancel",
+  "Apply") used to render noticeably shorter than an icon+text one
+- The Actions/Permissions/Rename/Progress strip auto-fits its actual
+  content height instead of a formula guess that always left a gap
+  below the last row
+- LT/RT (icon scale) now only zooms the sidebar (Places/Mounts/Trash)
+  and the main pane (file list, Trash view, in-folder search) — the
+  toolbar, Preview, and the Actions/Permissions/Rename/Progress strip
+  stay a fixed size
+- Small top/bottom padding in the Actions/Permissions/Rename/Progress
+  strip, so the first row doesn't sit flush against its own top border
+- Zoom in/out tooltips renamed "Smaller/Bigger icons" → "Smaller/Bigger
+  scale"
+
+### Fixed
+- Renaming/creating a folder auto-focused the name field for real editing
+  the instant the panel opened, so the very next d-pad press could move
+  the text cursor instead of navigating — the field now opens as a plain
+  navigable badge; pressing A (or clicking) enters editing, B leaves it
+  (without closing the panel)
+
+## [1.2.2] — 2026-09-08
+
+### Added
+- Thin title header above the toolbar ("BrowDeck — Browse on Deck") so the
+  toolbar's own icons no longer sit directly under Steam/gamescope's
+  performance overlay
+
+### Fixed
+- D-pad/stick navigation across the toolbar could snap back to the
+  hamburger button when it reached a disabled zoom button (icon scale
+  already at its min/max)
+
+## [1.2.1] — 2026-09-08
+
+### Fixed
+- First cold launch under gamescope (Steam Deck Game Mode) could render at
+  a small, blurry, stretched 800x600 instead of the real display resolution
+- The installed `.desktop` entry's `Exec=browdeck` failed outside a shell
+  that has `~/.local/bin` on `$PATH` — now points at the absolute installed
+  path instead
+
+## [1.2.0] — 2026-09-08
+
+### Added
+- Mimetype-aware file icons (archive/image/audio/video/pdf/code/data/font/
+  text categories, generic fallback for the rest)
+- Sort the file list by name/size/modified date, ascending or descending,
+  from the toolbar
+- Rename and New Folder actions in the Actions strip
+- Mass permission change (chmod) when multiple files/folders are selected
+- Sidebar info card for the current single selection: owner, group, size
+  (recursive total for folders), permissions, and link target for symlinks
+- Preview pane is now reachable via LB/RB alongside Sidebar/Active/Toolbar
+- Hold Start for 3s to bring up a Yes/Cancel Quit confirmation — no
+  keyboard Alt+F4 to rely on under gamescope/Game Mode
+
+### Changed
+- LB/RB pane order is now Places/Active/Preview/Toolbar
+- Permissions badge is available for any selection, not just a single file
+
+### Fixed
+- Preview via LB/RB could silently fail to focus except right after using
+  the Actions strip (stale shared focus state)
+- Opening Actions/Permissions from within Actions could steal that zone's
+  own closing check before it rendered
+
 ## [1.1.0] — 2026-09-08
 
 ### Added

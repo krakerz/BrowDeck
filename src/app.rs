@@ -1,13 +1,15 @@
 use crate::{
-    deleted, fileinfo, fileops, fonts, gamepad, iprolaunch, mounts, permissions, places, preview,
+    deleted, fileicons, fileinfo, fileops, fonts, gamepad, iprolaunch, mounts, permissions, places,
+    preview,
 };
 use egui_material_icons::MaterialIcon;
 use egui_material_icons::icons::{
-    ICON_ACCOUNT_TREE, ICON_ARROW_UPWARD, ICON_CHECK_CIRCLE, ICON_CLOSE, ICON_CONTENT_COPY,
-    ICON_CONTENT_CUT, ICON_CONTENT_PASTE, ICON_DELETE, ICON_DELETE_SWEEP, ICON_DESCRIPTION,
-    ICON_FOLDER, ICON_GAMEPAD, ICON_LOCK, ICON_MENU, ICON_OPEN_IN_NEW, ICON_PREVIEW,
-    ICON_PRIORITY_HIGH, ICON_REFRESH, ICON_RESTORE_FROM_TRASH, ICON_ROCKET_LAUNCH, ICON_SEARCH,
-    ICON_UNARCHIVE, ICON_VISIBILITY, ICON_VISIBILITY_OFF, ICON_ZOOM_IN, ICON_ZOOM_OUT,
+    ICON_ACCOUNT_TREE, ICON_ARROW_DOWNWARD, ICON_ARROW_UPWARD, ICON_CHECK_CIRCLE, ICON_CLOSE,
+    ICON_CONTENT_COPY, ICON_CONTENT_CUT, ICON_CONTENT_PASTE, ICON_CREATE_NEW_FOLDER, ICON_DELETE,
+    ICON_DELETE_SWEEP, ICON_DRIVE_FILE_RENAME_OUTLINE, ICON_GAMEPAD, ICON_LOCK, ICON_MENU,
+    ICON_OPEN_IN_NEW, ICON_PREVIEW, ICON_PRIORITY_HIGH, ICON_REFRESH, ICON_RESTORE_FROM_TRASH,
+    ICON_ROCKET_LAUNCH, ICON_SEARCH, ICON_SORT, ICON_UNARCHIVE, ICON_VISIBILITY,
+    ICON_VISIBILITY_OFF, ICON_ZOOM_IN, ICON_ZOOM_OUT,
 };
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -35,11 +37,65 @@ const PREVIEW_NORMAL_WIDTH: f32 = 320.0;
 /// scrollable so a long symlink target or a mounts list squeezing it
 /// doesn't overflow.
 const SIDEBAR_INFO_HEIGHT: f32 = 150.0;
+/// Height of the thin title bar reserved above the toolbar — its whole
+/// purpose is to push the real, interactive toolbar icons down out of the
+/// top-left corner, where Steam/gamescope's own performance overlay
+/// (MangoHud-style FPS/CPU/GPU readout) renders on top of the window and
+/// would otherwise sit right on top of them. Tall enough to clear that
+/// overlay's usual height with a little headroom.
+const HEADER_HEIGHT: f32 = 30.0;
 
 struct Entry {
     name: String,
     path: PathBuf,
     is_dir: bool,
+    /// 0 for directories — sorting by size only makes sense for files;
+    /// dirs already always sort first regardless of `SortBy`.
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SortBy {
+    Name,
+    Size,
+    Modified,
+}
+
+impl SortBy {
+    fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Size,
+            Self::Size => Self::Modified,
+            Self::Modified => Self::Name,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Name => "Name",
+            Self::Size => "Size",
+            Self::Modified => "Modified",
+        }
+    }
+}
+
+/// Dirs always sort before files, regardless of `sort_by`/`ascending` —
+/// only the order *within* dirs and *within* files follows those. A free
+/// function (not a method) so it's unit-testable without constructing a
+/// full `BrowDeckApp`.
+fn compare_entries(a: &Entry, b: &Entry, sort_by: SortBy, ascending: bool) -> std::cmp::Ordering {
+    let primary = match sort_by {
+        SortBy::Name => a.name.cmp(&b.name),
+        SortBy::Size => a.size.cmp(&b.size),
+        SortBy::Modified => a.modified.cmp(&b.modified),
+    };
+    let primary = if ascending {
+        primary
+    } else {
+        primary.reverse()
+    };
+    b.is_dir.cmp(&a.is_dir).then(primary)
 }
 
 struct Clipboard {
@@ -54,17 +110,25 @@ struct PermEditor {
     mode: u32,
 }
 
+struct RenameEditor {
+    /// `None` — creating a new folder in `current_dir`. `Some(path)` —
+    /// renaming that path.
+    target: Option<PathBuf>,
+    text: String,
+}
+
 enum View {
     Dir,
     Trash,
 }
 
 /// Which pane currently holds keyboard focus. `Sidebar`/`Active`/`Toolbar`
-/// are the three sections LB/RB cycle between (see `pane_cycle`); `Right`
-/// (preview/actions/permissions/progress) is reached only via explicit
-/// triggers (X, R3, the Permissions button, …), not the LB/RB cycle, but
-/// still gets its own highlight and dpad/stick input stays confined to it
-/// like any other pane while it's focused.
+/// always cycle via LB/RB (see `pane_cycle`); `Right` joins that cycle
+/// only while Preview is showing — the Actions/Permissions/Progress strip
+/// (also `Right`) is reached only via its own explicit triggers (X, R3,
+/// the Permissions button, …), never LB/RB. Whichever way it's reached,
+/// dpad/stick input stays confined to it like any other pane while it's
+/// focused.
 #[derive(Clone, Copy, PartialEq)]
 enum Pane {
     Sidebar,
@@ -93,6 +157,11 @@ pub struct BrowDeckApp {
     /// Filtered at render time (see the dir-list loop), same approach as
     /// `show_all_mounts`, so toggling doesn't need a re-`refresh()`.
     show_hidden_files: bool,
+    /// Applied in `sort_entries` — folders always sort first regardless
+    /// of either of these, only the order within dirs/within files
+    /// changes.
+    sort_by: SortBy,
+    sort_ascending: bool,
     preview_enabled: bool,
     /// Gamepad Select toggles this — widens the right pane to 40% of the
     /// window instead of its normal (default/resizable) width.
@@ -102,6 +171,22 @@ pub struct BrowDeckApp {
     preview_text: Option<(PathBuf, String)>,
     context_menu_open: bool,
     perm_editor: Option<PermEditor>,
+    rename_editor: Option<RenameEditor>,
+    /// True while the Rename/New Folder name field has *real* keyboard
+    /// focus (not just d-pad selection) — while set, the field renders as
+    /// an actual `TextEdit` and gamepad d-pad/left-stick input is
+    /// swallowed entirely rather than routed through the normal strip
+    /// navigation. See `show_rename_editor`'s doc comment for why: once
+    /// the field has genuine focus, Steam Input's own text-field handling
+    /// can route the same physical d-pad press into moving the text
+    /// cursor, and letting our own navigation *also* act on it at the
+    /// same time fought over focus.
+    rename_editing: bool,
+    /// One-shot: focus the name field (whichever form — badge or real
+    /// `TextEdit` — actually renders) the *next* time `show_rename_editor`
+    /// runs. Deliberately separate from `focus_first_action` — see
+    /// `show_rename_editor`'s local `focus_pending` doc comment for why.
+    rename_focus_pending: bool,
     search_query: String,
     search_open: bool,
     /// One-shot flags consumed the next time the relevant widget is drawn.
@@ -119,6 +204,17 @@ pub struct BrowDeckApp {
     /// bar (not part of `right_rect`/Preview), but still classified as
     /// `Pane::Right` for focus/highlight purposes.
     actions_strip_rect: Option<egui::Rect>,
+    /// The strip's actual content height, measured from last frame's
+    /// `ScrollAreaOutput::content_size` — used (clamped) to reserve
+    /// *this* frame's `strip_height`, instead of a `ROW_HEIGHT * row
+    /// count` guess. That guess was tuned to the tallest (icon) row, so
+    /// once every badge became a uniform height (see `badge_min_height`)
+    /// it *still* over-reserved — the true per-row height (badges plus
+    /// `horizontal_wrapped`'s own spacing) was never going to match a
+    /// guessed formula exactly. One frame of lag (the very first frame
+    /// a new row count appears, before it's measured) is an acceptable
+    /// trade for genuinely auto-fitting afterward.
+    strip_measured_height: f32,
     toolbar_rect: Option<egui::Rect>,
     /// Ids of last frame's file-list rows paired with their path — used to
     /// look up which entry is focused when toggling multi-select, and to
@@ -211,13 +307,26 @@ pub struct BrowDeckApp {
     /// succeeds; every "what pane are we in" decision reads this instead
     /// of calling `focused_pane()` directly.
     current_pane: Option<Pane>,
+    /// True while the Start-held-3s Quit confirmation dialog is showing —
+    /// while set, gamepad input is handled entirely by its own self-
+    /// contained Left/Right/Activate/Back path (see the `Quit` action
+    /// arm), bypassing the normal focus/pane system so it can't leak.
+    quit_confirm: bool,
+    /// Which button is highlighted in the Quit dialog — `false` (Cancel)
+    /// is the default so an accidental confirm always requires an
+    /// explicit Right + Activate, never just a stray Activate.
+    quit_confirm_yes: bool,
+    /// Whether the title header above the toolbar shows — from
+    /// `config.toml`'s `show_header`, fixed for the life of the app (no
+    /// in-app toggle, unlike `show_hidden_files`/`show_all_mounts`).
+    show_header: bool,
 }
 
 /// How long a finished copy/move job stays visible before auto-closing.
 const JOB_LINGER: Duration = Duration::from_secs(2);
 
 impl BrowDeckApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, show_header: bool) -> Self {
         egui_material_icons::initialize(&cc.egui_ctx);
         egui_extras::install_image_loaders(&cc.egui_ctx);
         fonts::install_cjk_fallback(&cc.egui_ctx);
@@ -240,11 +349,16 @@ impl BrowDeckApp {
             icon_scale: 1.0,
             show_all_mounts: false,
             show_hidden_files: false,
+            sort_by: SortBy::Name,
+            sort_ascending: true,
             preview_enabled: false,
             preview_wide: false,
             preview_text: None,
             context_menu_open: false,
             perm_editor: None,
+            rename_editor: None,
+            rename_editing: false,
+            rename_focus_pending: false,
             search_query: String::new(),
             search_open: false,
             focus_search: false,
@@ -254,6 +368,10 @@ impl BrowDeckApp {
             central_rect: None,
             right_rect: None,
             actions_strip_rect: None,
+            // A reasonable single-row starting guess for the very first
+            // time any zone opens, before there's a real measurement to
+            // use yet — see the field's own doc comment.
+            strip_measured_height: 36.0,
             toolbar_rect: None,
             entry_ids: Vec::new(),
             trash_ids: Vec::new(),
@@ -277,6 +395,9 @@ impl BrowDeckApp {
             multi_select: false,
             multi_selected: std::collections::HashSet::new(),
             current_pane: None,
+            quit_confirm: false,
+            quit_confirm_yes: false,
+            show_header,
         };
         app.refresh();
         app
@@ -285,7 +406,19 @@ impl BrowDeckApp {
     /// Renders a [`MaterialIcon`] at the current icon scale — use this
     /// instead of a bare `ICON_*` constant everywhere in the UI so the
     /// zoom +/- controls affect every icon consistently.
+    /// Fixed-size icon, ignoring `icon_scale` — the toolbar, Preview, and
+    /// Actions/Permissions/Rename/Progress strip all use this so LT/RT
+    /// zoom doesn't change their size; see `icon_scaled` for the handful
+    /// of places that *should* zoom.
     fn icon(&self, icon: MaterialIcon) -> egui::RichText {
+        icon.rich_text().size(BASE_ICON_SIZE)
+    }
+
+    /// Same as `icon`, but scales with `icon_scale` (LT/RT) — reserved
+    /// for the sidebar (Places/Mounts/Trash) and the main pane (file
+    /// list, trash view, in-folder search), the only things the user
+    /// wants LT/RT to actually zoom.
+    fn icon_scaled(&self, icon: MaterialIcon) -> egui::RichText {
         icon.rich_text().size(BASE_ICON_SIZE * self.icon_scale)
     }
 
@@ -344,11 +477,42 @@ impl BrowDeckApp {
                 // `path.is_dir()` follows symlinks (unlike `file_type()`,
                 // which reports a symlink-to-directory as not-a-directory).
                 let is_dir = path.is_dir();
-                Entry { name, path, is_dir }
+                let meta = std::fs::metadata(&path).ok();
+                let size = if is_dir {
+                    0
+                } else {
+                    meta.as_ref().map(|m| m.len()).unwrap_or(0)
+                };
+                let modified = meta.and_then(|m| m.modified().ok());
+                Entry {
+                    name,
+                    path,
+                    is_dir,
+                    size,
+                    modified,
+                }
             })
             .collect();
-        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
+        self.sort_entries(&mut entries);
         self.entries = entries;
+    }
+
+    /// Called after `sort_by`/`sort_ascending` changes — `refresh()` is
+    /// the only place `self.entries` actually gets re-sorted, and a live
+    /// recursive search has its own separate result list that needs the
+    /// same nudge to re-walk-and-resort.
+    fn resort_current_view(&mut self) {
+        self.refresh();
+        if self.recursive_search && self.search_open && !self.search_query.is_empty() {
+            self.recursive_dirty = true;
+            self.recursive_spinner_shown = false;
+        }
+    }
+
+    /// Dirs always sort first, regardless of `sort_by`/`sort_ascending` —
+    /// only the order *within* dirs and *within* files follows those.
+    fn sort_entries(&self, entries: &mut [Entry]) {
+        entries.sort_by(|a, b| compare_entries(a, b, self.sort_by, self.sort_ascending));
     }
 
     /// Walks `current_dir` recursively looking for entries (at any depth)
@@ -383,10 +547,19 @@ impl BrowDeckApp {
                         .unwrap_or(&path)
                         .to_string_lossy()
                         .into_owned();
+                    let meta = entry.metadata().ok();
+                    let size = if is_dir {
+                        0
+                    } else {
+                        meta.as_ref().map(|m| m.len()).unwrap_or(0)
+                    };
+                    let modified = meta.and_then(|m| m.modified().ok());
                     results.push(Entry {
                         name: display,
                         path: path.clone(),
                         is_dir,
+                        size,
+                        modified,
                     });
                 }
                 if entry.file_type().is_ok_and(|t| t.is_dir()) {
@@ -394,6 +567,7 @@ impl BrowDeckApp {
                 }
             }
         }
+        self.sort_entries(&mut results);
         results
     }
 
@@ -439,6 +613,17 @@ impl BrowDeckApp {
         if self.multi_select {
             self.multi_select = false;
             self.multi_selected.clear();
+        } else if self.rename_editor.is_some() {
+            // Same reasoning as the perm_editor branch below: Rename/New
+            // Folder also opens *from* Actions, so it's the newer of the
+            // two if both somehow ended up open. (Only reachable while
+            // not mid-edit — B during real editing is intercepted earlier,
+            // in the gamepad dispatch loop, and only exits edit mode.)
+            self.rename_editor = None;
+            self.rename_editing = false;
+            if self.context_menu_open {
+                self.focus_first_action = true;
+            }
         } else if self.perm_editor.is_some() {
             // Permissions opens *from* Actions, never the other way
             // around, so it's always the more-recently-opened of the two
@@ -546,7 +731,8 @@ impl BrowDeckApp {
     /// produce an out-of-strip id — nothing left for this to correct in
     /// the steady state.
     fn enforce_strip_focus_guard(&mut self, ctx: &egui::Context) {
-        let guard_active = self.context_menu_open || self.perm_editor.is_some();
+        let guard_active =
+            self.context_menu_open || self.perm_editor.is_some() || self.rename_editor.is_some();
         if guard_active
             && !self.focus_inside_strip(ctx)
             && let Some(id) = self.right_last_focus
@@ -574,7 +760,8 @@ impl BrowDeckApp {
         // through a known list can't ever produce an out-of-strip id.
         // Left/Right step within the current row; Up/Down switch rows
         // (Actions <-> Permissions) while keeping roughly the same column.
-        let guard_active = self.context_menu_open || self.perm_editor.is_some();
+        let guard_active =
+            self.context_menu_open || self.perm_editor.is_some() || self.rename_editor.is_some();
         if guard_active {
             let inside = self.focus_inside_strip(ctx);
             if inside && !self.right_focus_rows.is_empty() {
@@ -713,11 +900,11 @@ impl BrowDeckApp {
     /// LB/RB — move to the next/previous pane in [`Self::pane_cycle`] and
     /// restore its remembered cursor position (see [`Self::focus_pane`]).
     fn switch_pane(&mut self, ctx: &egui::Context, delta: isize) {
-        // LB/RB is fully disabled — not just restricted — while Actions
-        // and/or Permissions is open. Progress alone doesn't count: it's a
-        // plain display, nothing to interact with, so no reason to trap
-        // focus there.
-        if self.context_menu_open || self.perm_editor.is_some() {
+        // LB/RB is fully disabled — not just restricted — while Actions,
+        // Permissions, and/or Rename/New Folder is open. Progress alone
+        // doesn't count: it's a plain display, nothing to interact with,
+        // so no reason to trap focus there.
+        if self.context_menu_open || self.perm_editor.is_some() || self.rename_editor.is_some() {
             return;
         }
         let cycle = self.pane_cycle();
@@ -858,24 +1045,28 @@ impl BrowDeckApp {
 
     /// Colored circular badge for a face button (A/B/X/Y), matching
     /// standard controller button colors.
+    /// Diameter of the A/B/X/Y face-button badges.
+    const FACE_BADGE_SIZE: f32 = 20.0;
+
     fn face_badge(ui: &mut egui::Ui, letter: &str, color: egui::Color32) {
-        egui::Frame::default()
-            .fill(color)
-            .corner_radius(8.0)
-            .inner_margin(egui::Margin {
-                left: 6,
-                right: 6,
-                top: 1,
-                bottom: 1,
-            })
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(letter)
-                        .strong()
-                        .color(egui::Color32::WHITE)
-                        .size(12.0),
-                );
-            });
+        // A `Frame` with margins guessed to make a single glyph's box
+        // roughly square (an earlier attempt) still came out visibly
+        // wider than tall — text width doesn't reliably match line
+        // height, so "roughly square corners rounded a lot" never
+        // actually reads as a true circle. Painting a real
+        // `circle_filled` at a fixed diameter, independent of the
+        // letter's own size, is exact regardless of which letter.
+        let size = egui::vec2(Self::FACE_BADGE_SIZE, Self::FACE_BADGE_SIZE);
+        let (rect, _response) = ui.allocate_exact_size(size, egui::Sense::hover());
+        ui.painter()
+            .circle_filled(rect.center(), Self::FACE_BADGE_SIZE / 2.0, color);
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            letter,
+            egui::FontId::proportional(12.0),
+            egui::Color32::WHITE,
+        );
     }
 
     /// Gray rounded badge for a non-face-button control (LB/RB/LT/RT/L3/R3).
@@ -894,11 +1085,31 @@ impl BrowDeckApp {
             });
     }
 
+    /// A badge with an icon (e.g. `self.icon(ICON_CONTENT_COPY)`) naturally
+    /// renders taller than one that's just text (e.g. "Cancel") — the
+    /// icon glyph's own line height exceeds the body text's. Passed as
+    /// `min_height` to `action_badge`/`action_badge_disabled` so every
+    /// badge in a row — icon or not — ends up the same height instead of
+    /// the row looking visibly uneven (reported by the user, comparing
+    /// the Actions row against Rename/Permissions' text-only badges).
+    /// Not `icon_scale`-aware — the strip's own icons are now fixed-size
+    /// (`self.icon`, not `self.icon_scaled`) per the user's ask that
+    /// LT/RT zoom not affect it, so this stays fixed too.
+    fn badge_min_height(&self) -> f32 {
+        BASE_ICON_SIZE + 8.0
+    }
+
     /// A compact, clickable button styled like the bottom bar's badges
     /// (small, rounded, gray) instead of a full-size default `Button` —
     /// used throughout the Actions/Permissions/Progress strip so it reads
     /// as one cohesive row instead of a heavier-looking separate widget.
-    fn action_badge<'a>(ui: &mut egui::Ui, content: impl egui::IntoAtoms<'a>) -> egui::Response {
+    /// `min_height` (see `badge_min_height`) keeps icon and non-icon
+    /// badges in the same row the same height.
+    fn action_badge<'a>(
+        min_height: f32,
+        ui: &mut egui::Ui,
+        content: impl egui::IntoAtoms<'a>,
+    ) -> egui::Response {
         // Scoped so it doesn't bleed into anything drawn after this badge.
         // egui's `button_style()` computes `inner_margin` as
         // `button_padding + expansion - bg_stroke.width` — default
@@ -916,7 +1127,8 @@ impl BrowDeckApp {
                 egui::Button::new(content)
                     .small()
                     .corner_radius(4.0)
-                    .fill(egui::Color32::from_gray(70)),
+                    .fill(egui::Color32::from_gray(70))
+                    .min_size(egui::vec2(0.0, min_height)),
             )
         })
         .inner
@@ -927,6 +1139,7 @@ impl BrowDeckApp {
     /// the library" state), so it reads as a status indicator rather than
     /// a button that happens to do nothing.
     fn action_badge_disabled<'a>(
+        min_height: f32,
         ui: &mut egui::Ui,
         content: impl egui::IntoAtoms<'a>,
     ) -> egui::Response {
@@ -935,7 +1148,8 @@ impl BrowDeckApp {
             egui::Button::new(content)
                 .small()
                 .corner_radius(4.0)
-                .fill(egui::Color32::from_gray(70)),
+                .fill(egui::Color32::from_gray(70))
+                .min_size(egui::vec2(0.0, min_height)),
         )
     }
 
@@ -967,61 +1181,119 @@ impl BrowDeckApp {
         &self.selected_info.as_ref().unwrap().1
     }
 
+    /// The Start-held-3s Quit confirmation — a centered modal whose
+    /// backdrop blocks all other input. Gamepad Left/Right/Activate/Back
+    /// are handled directly in the poll loop (see the `Quit` action arm),
+    /// bypassing the normal focus/pane system entirely so it can't leak
+    /// the way the Actions strip once did; the highlighted button here
+    /// just reflects that gamepad-tracked selection. Mouse clicks work
+    /// independently of it, same as any other button.
+    fn show_quit_confirm(&mut self, ctx: &egui::Context) {
+        egui::Modal::new(egui::Id::new("quit_confirm")).show(ctx, |ui| {
+            ui.set_width(220.0);
+            ui.vertical_centered(|ui| {
+                ui.label("Quit BrowDeck?");
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let yes_fill = if self.quit_confirm_yes {
+                        egui::Color32::from_rgb(180, 60, 60)
+                    } else {
+                        egui::Color32::from_gray(70)
+                    };
+                    let cancel_fill = if self.quit_confirm_yes {
+                        egui::Color32::from_gray(70)
+                    } else {
+                        egui::Color32::from_gray(110)
+                    };
+                    let yes = ui.add(egui::Button::new("Yes").fill(yes_fill));
+                    let cancel = ui.add(egui::Button::new("Cancel").fill(cancel_fill));
+                    if yes.clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    if cancel.clicked() {
+                        self.quit_confirm = false;
+                    }
+                });
+            });
+        });
+    }
+
     /// Persistent bottom bar: an always-visible gamepad button legend
     /// (only while a real gamepad is connected) plus the app version,
     /// rather than scattering button hints next to individual controls.
+    /// Fixed width reserved for the version label on the right — sized
+    /// generously for "v99.99.99", not measured, since it's just a small
+    /// tuck-in-the-corner label, not something that needs pixel-exact
+    /// fitting.
+    const STATUS_BAR_VERSION_WIDTH: f32 = 60.0;
+
     fn show_status_bar(&self, ui: &mut egui::Ui) {
-        // `ui.horizontal` centers cross-axis relative to a small initial
-        // height *guess* (`spacing().interact_size.y`), not the Panel's
-        // real fixed height — so content visually hugged the top of the
-        // (taller) 36px band instead of sitting centered in it. Explicitly
-        // allocating the full available height first fixes that.
-        let full_size = ui.available_size();
-        ui.allocate_ui_with_layout(
-            full_size,
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                if self.has_connected_pad() {
-                    // Deliberately not `self.icon(...)` — this bar has a fixed
-                    // height (`.exact_size` on its Panel) and must stay that
-                    // way regardless of the icon-scale setting, unlike the
-                    // toolbar (which has no fixed size and simply grows/
-                    // shrinks with it).
-                    ui.label(ICON_GAMEPAD.rich_text().size(BASE_ICON_SIZE));
-                    ui.label("Move");
-                    ui.separator();
-                    Self::face_badge(ui, "A", egui::Color32::from_rgb(0x5A, 0xB4, 0x4B));
-                    ui.label("Open");
-                    Self::face_badge(ui, "B", egui::Color32::from_rgb(0xD1, 0x4A, 0x4A));
-                    ui.label("Back/Up dir");
-                    Self::face_badge(ui, "X", egui::Color32::from_rgb(0x3D, 0x7E, 0xD6));
-                    ui.label("Actions");
-                    Self::face_badge(ui, "Y", egui::Color32::from_rgb(0xD9, 0xB4, 0x33));
-                    ui.label("Refresh (hold: Search)");
-                    ui.separator();
-                    Self::key_badge(ui, "LB/RB");
-                    ui.label("Pane");
-                    Self::key_badge(ui, "LT/RT");
-                    ui.label("Zoom");
-                    Self::key_badge(ui, "L3");
-                    ui.label("Multi-select");
-                    Self::key_badge(ui, "R3/Start");
-                    ui.label("Open");
-                    Self::key_badge(ui, "Select");
-                    ui.label("Preview width");
-                    if self.multi_select {
-                        ui.separator();
-                        ui.colored_label(
-                            egui::Color32::from_rgb(100, 150, 255),
-                            format!("Multi-select: {} selected", self.multi_selected.len()),
-                        );
-                    }
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak(format!("v{}", env!("CARGO_PKG_VERSION")));
-                });
-            },
-        );
+        // Two independent child `Ui`s over explicit, non-overlapping
+        // rects (the pattern used everywhere else in this app for a
+        // fixed-size region — see e.g. the Actions strip) rather than
+        // sibling `ui.with_layout` calls sharing one `Ui`'s cursor:
+        // mixing a `right_to_left` and a `left_to_right` layout as
+        // siblings of the same `Ui` left the second one with nothing to
+        // show (its content never painted at all) — not investigated
+        // further since this reservation approach is already proven
+        // reliable elsewhere in the codebase.
+        let full_rect = ui.available_rect_before_wrap();
+        ui.allocate_rect(full_rect, egui::Sense::hover());
+        let mut version_rect = full_rect;
+        version_rect.set_left(full_rect.right() - Self::STATUS_BAR_VERSION_WIDTH);
+        let mut legend_rect = full_rect;
+        legend_rect.set_right(version_rect.left());
+
+        let mut version_ui = ui.new_child(egui::UiBuilder::new().max_rect(version_rect));
+        version_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.weak(format!("v{}", env!("CARGO_PKG_VERSION")));
+        });
+
+        // `Layout::left_to_right` centers on the main axis by default —
+        // see its own doc comment ("looks best to e.g. center text
+        // within a button") — so no extra `with_main_align` is needed
+        // for this to also center horizontally, not just vertically.
+        let mut legend_ui = ui.new_child(egui::UiBuilder::new().max_rect(legend_rect));
+        legend_ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            // Always shown, even with no gamepad connected — the legend
+            // also documents what the mouse/keyboard equivalents are for
+            // someone who hasn't plugged one in yet, not just a live
+            // reference for one that's already connected.
+            //
+            // Deliberately not `self.icon(...)` — this bar has a fixed
+            // height (`.exact_size` on its Panel) and must stay that way
+            // regardless of the icon-scale setting, unlike the toolbar
+            // (which has no fixed size and simply grows/shrinks with it).
+            ui.label(ICON_GAMEPAD.rich_text().size(BASE_ICON_SIZE));
+            ui.label("Move");
+            ui.separator();
+            Self::face_badge(ui, "A", egui::Color32::from_rgb(0x5A, 0xB4, 0x4B));
+            ui.label("Open");
+            Self::face_badge(ui, "B", egui::Color32::from_rgb(0xD1, 0x4A, 0x4A));
+            ui.label("Back");
+            Self::face_badge(ui, "X", egui::Color32::from_rgb(0x3D, 0x7E, 0xD6));
+            ui.label("Actions");
+            Self::face_badge(ui, "Y", egui::Color32::from_rgb(0xD9, 0xB4, 0x33));
+            ui.label("Refresh (Search)");
+            ui.separator();
+            Self::key_badge(ui, "LB/RB");
+            ui.label("Pane");
+            Self::key_badge(ui, "LT/RT");
+            ui.label("Zoom");
+            Self::key_badge(ui, "L3");
+            ui.label("Multi-select");
+            Self::key_badge(ui, "R3/Start");
+            ui.label("Open");
+            Self::key_badge(ui, "Select");
+            ui.label("Preview width");
+            if self.multi_select {
+                ui.separator();
+                ui.colored_label(
+                    egui::Color32::from_rgb(100, 150, 255),
+                    format!("Multi-select: {} selected", self.multi_selected.len()),
+                );
+            }
+        });
     }
 
     /// Gamepad R3 and the actions panel's "Open" button.
@@ -1132,11 +1404,10 @@ impl BrowDeckApp {
     /// gate right-click on empty space.
     fn actions_available(&self) -> bool {
         match self.view {
-            View::Dir => {
-                self.selected.is_some()
-                    || self.clipboard.is_some()
-                    || !self.multi_selected.is_empty()
-            }
+            // Always true — New Folder is a valid action even with
+            // nothing selected, same as any file manager's empty-space
+            // right-click.
+            View::Dir => true,
             View::Trash => self.selected_trash.is_some() || !self.trash_entries.is_empty(),
         }
     }
@@ -1199,7 +1470,48 @@ impl eframe::App for BrowDeckApp {
             // and stick input feel responsive, not just event-driven.
             ui.ctx().request_repaint_after(Duration::from_millis(16));
             for action in actions {
+                // While the Quit dialog is up, it owns all gamepad input —
+                // handled entirely here, bypassing the normal focus/pane
+                // system, so there's no risk of it leaking into the file
+                // list the way the Actions strip once did.
+                if self.quit_confirm {
+                    match action {
+                        gamepad::Action::Move(egui::FocusDirection::Left)
+                        | gamepad::Action::Move(egui::FocusDirection::Right) => {
+                            self.quit_confirm_yes = !self.quit_confirm_yes;
+                        }
+                        gamepad::Action::Activate => {
+                            if self.quit_confirm_yes {
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                            self.quit_confirm = false;
+                        }
+                        gamepad::Action::Back => self.quit_confirm = false,
+                        _ => {}
+                    }
+                    continue;
+                }
+                // While the Rename/New Folder text field has real
+                // keyboard focus, gamepad d-pad/left-stick input is
+                // swallowed instead of driving the normal strip
+                // navigation — see `rename_editing`'s field doc comment.
+                // Back exits edit mode (returns to navigating the strip
+                // as elements, doesn't close the zone); everything else,
+                // Activate included, is a no-op here since actual typing
+                // happens via a real/on-screen keyboard, not this action
+                // system.
+                if self.rename_editing {
+                    if matches!(action, gamepad::Action::Back) {
+                        self.rename_editing = false;
+                        self.rename_focus_pending = true;
+                    }
+                    continue;
+                }
                 match action {
+                    gamepad::Action::Quit => {
+                        self.quit_confirm = true;
+                        self.quit_confirm_yes = false;
+                    }
                     gamepad::Action::Move(dir) => {
                         // egui's directional focus movement only works
                         // *relative to* an already-focused widget — if
@@ -1321,6 +1633,16 @@ impl eframe::App for BrowDeckApp {
             }
         }
 
+        if self.show_header {
+            egui::Panel::top("header_bar")
+                .exact_size(HEADER_HEIGHT)
+                .show(ui, |ui| {
+                    ui.centered_and_justified(|ui| {
+                        ui.weak("BrowDeck — Browse on Deck");
+                    });
+                });
+        }
+
         let toolbar_resp = egui::Panel::top("toolbar").show(ui, |ui| {
             Self::paint_pane_highlight(ui, self.pane_undimmed(focused_pane, Pane::Toolbar));
             let mut toolbar_ids = Vec::new();
@@ -1368,27 +1690,61 @@ impl eframe::App for BrowDeckApp {
                     self.show_hidden_files = !self.show_hidden_files;
                 }
                 toolbar_ids.push(hidden.id);
+                let sort_by = ui
+                    .button((self.icon(ICON_SORT), self.sort_by.label()))
+                    .on_hover_text("Cycle sort: Name / Size / Modified");
+                if sort_by.clicked() {
+                    self.sort_by = self.sort_by.next();
+                    self.resort_current_view();
+                }
+                toolbar_ids.push(sort_by.id);
+                let ascending = self.sort_ascending;
+                let sort_dir = ui
+                    .button(self.icon(if ascending {
+                        ICON_ARROW_UPWARD
+                    } else {
+                        ICON_ARROW_DOWNWARD
+                    }))
+                    .on_hover_text(if ascending {
+                        "Ascending — click for descending"
+                    } else {
+                        "Descending — click for ascending"
+                    });
+                if sort_dir.clicked() {
+                    self.sort_ascending = !self.sort_ascending;
+                    self.resort_current_view();
+                }
+                toolbar_ids.push(sort_dir.id);
                 ui.separator();
+                // A disabled button (at either end of the scale range)
+                // surrenders focus the instant egui draws it — see
+                // NOTES.md "toolbar teleport at min/max zoom" — so its id
+                // must never be handed to `set_focus`/land in
+                // `toolbar_ids`, or d-pad/stick navigation stepping onto
+                // it snaps back to index 0 (the hamburger) next frame.
+                let zoom_out_enabled = *ICON_SCALE_RANGE.start() < self.icon_scale;
                 let zoom_out = ui
                     .add_enabled(
-                        *ICON_SCALE_RANGE.start() < self.icon_scale,
+                        zoom_out_enabled,
                         egui::Button::new(self.icon(ICON_ZOOM_OUT)),
                     )
-                    .on_hover_text("Smaller icons");
+                    .on_hover_text("Smaller scale");
                 if zoom_out.clicked() {
                     self.scale_down();
                 }
-                toolbar_ids.push(zoom_out.id);
+                if zoom_out_enabled {
+                    toolbar_ids.push(zoom_out.id);
+                }
+                let zoom_in_enabled = self.icon_scale < *ICON_SCALE_RANGE.end();
                 let zoom_in = ui
-                    .add_enabled(
-                        self.icon_scale < *ICON_SCALE_RANGE.end(),
-                        egui::Button::new(self.icon(ICON_ZOOM_IN)),
-                    )
-                    .on_hover_text("Bigger icons");
+                    .add_enabled(zoom_in_enabled, egui::Button::new(self.icon(ICON_ZOOM_IN)))
+                    .on_hover_text("Bigger scale");
                 if zoom_in.clicked() {
                     self.scale_up();
                 }
-                toolbar_ids.push(zoom_in.id);
+                if zoom_in_enabled {
+                    toolbar_ids.push(zoom_in.id);
+                }
                 ui.separator();
                 let preview = ui
                     .selectable_label(self.preview_enabled, (self.icon(ICON_PREVIEW), "Preview"))
@@ -1449,19 +1805,21 @@ impl eframe::App for BrowDeckApp {
 
         let preview_visible = self.preview_visible();
         let show_actions = self.context_menu_open;
+        let show_rename = self.rename_editor.is_some();
         let show_permissions = self.perm_editor.is_some();
         let show_progress = !self.jobs.is_empty();
 
-        // Actions/Permissions/Progress are a horizontal strip along the
-        // very bottom, above the status bar, spanning from the
+        // Actions/Rename/Permissions/Progress are a horizontal strip
+        // along the very bottom, above the status bar, spanning from the
         // sidebar/main-pane border to the window's right edge (drawn
         // *after* the sidebar so it naturally excludes that width, and
         // *before* the right/central panels so they get whatever's left
         // above it) — not part of the Preview pane. Rows stack in fixed
-        // priority order (Actions, Permissions, Progress), skipping
-        // whichever aren't active.
+        // priority order (Actions, Rename, Permissions, Progress),
+        // skipping whichever aren't active.
         enum FooterZone {
             Actions,
+            Rename,
             Permissions,
             Progress,
         }
@@ -1469,37 +1827,53 @@ impl eframe::App for BrowDeckApp {
         if show_actions {
             active_zones.push(FooterZone::Actions);
         }
+        if show_rename {
+            active_zones.push(FooterZone::Rename);
+        }
         if show_permissions {
             active_zones.push(FooterZone::Permissions);
         }
         if show_progress {
             active_zones.push(FooterZone::Progress);
         }
-        // One compact row per zone (Progress: one row per job), badge-
-        // styled like the bottom bar, instead of a tall boxed grid.
-        const ROW_HEIGHT: f32 = 36.0;
-        const STATUS_BAR_HEIGHT: f32 = 36.0;
-        let total_rows: usize = active_zones
-            .iter()
-            .map(|zone| match zone {
-                FooterZone::Progress => self.jobs.len().max(1),
-                _ => 1,
-            })
-            .sum();
+        const STATUS_BAR_HEIGHT: f32 = 32.0;
+        // Reserved height auto-fits the strip's *actual* content (see
+        // `strip_measured_height`'s doc comment) rather than a
+        // `ROW_HEIGHT * row count` guess, which left a visible gap even
+        // after every badge became a uniform height — the true per-row
+        // footprint (badges plus `horizontal_wrapped`'s own spacing)
+        // never matched the guess exactly. Clamped to a sane minimum (in
+        // case a stale/zero measurement ever gets cached) and the same
+        // 220 max as before, so a great many simultaneous Progress rows
+        // still scroll instead of taking over the screen.
         let strip_height = if active_zones.is_empty() {
             0.0
         } else {
-            (ROW_HEIGHT * total_rows as f32 + 8.0).min(220.0)
+            self.strip_measured_height.clamp(20.0, 220.0)
         };
         // The strip and the status bar are laid out inside a *single*
-        // bottom Panel rather than two separate stacked `Panel::bottom`
-        // calls. Stacking a third `Panel::bottom` (after `status_bar`,
-        // then `sidebar`'s left panel) inside the same `ui` produced a
-        // panel whose content `ui.max_rect()` didn't match its own
-        // `response.rect` by ~20px every frame — the content silently
-        // painted into the file list's territory and got covered by its
-        // later, opaque background fill. One Panel with internal rows
-        // sidesteps that stacked-panel negotiation bug entirely.
+        // bottom Panel, always called (even when `active_zones` is
+        // empty, at just `STATUS_BAR_HEIGHT` tall) — two things learned
+        // the hard way earlier this session, both on this exact Panel:
+        // (1) splitting the status bar into its own separate, earlier,
+        // full-width `Panel::bottom` (called before the sidebar's
+        // `Panel::left`, to recover the sidebar's width for the legend)
+        // produced real layout bugs once this strip was showing too —
+        // an uneven pane-highlight border, the strip's top edge
+        // overlapping the file list, and a stray gap between the strip
+        // and the status bar. Not root-caused further; reverted back to
+        // one combined Panel scoped to exclude the sidebar's column
+        // (like this whole strip always has been), just with the
+        // legend's *content* still centered within that narrower width
+        // rather than the full window — the earlier fixes (no
+        // `ScrollArea`, trimmed labels, legend always shown) already
+        // make it fit comfortably there anyway. (2) Stacking a *third*
+        // `Panel::bottom` (after `status_bar`, then `sidebar`'s left
+        // panel) inside the same `ui` produced a panel whose content
+        // `ui.max_rect()` didn't match its own `response.rect` by ~20px
+        // every frame — the content silently painted into the file
+        // list's territory. One Panel with internal rows sidesteps both
+        // of these entirely.
         let footer_height = STATUS_BAR_HEIGHT + strip_height;
         egui::Panel::bottom("footer")
             .exact_size(footer_height)
@@ -1531,7 +1905,7 @@ impl eframe::App for BrowDeckApp {
                         &strip_ui,
                         self.pane_undimmed(focused_pane, Pane::Right),
                     );
-                    egui::ScrollArea::vertical()
+                    let scroll_output = egui::ScrollArea::vertical()
                         .id_salt("actions_strip_scroll")
                         .auto_shrink([false, false])
                         .scroll_bar_visibility(ALWAYS_VISIBLE_SCROLLBAR)
@@ -1539,14 +1913,26 @@ impl eframe::App for BrowDeckApp {
                         .show(&mut strip_ui, |ui| {
                             self.apply_pending_scroll(ui, Pane::Right);
                             self.right_focus_rows.clear();
+                            // A little breathing room above the first row
+                            // and below the last — the auto-fit measurement
+                            // (see `strip_measured_height`) tracks content
+                            // exactly, so with none at all the first row
+                            // sat flush against the strip's own top border,
+                            // reading as too tight.
+                            ui.add_space(2.0);
                             for zone in &active_zones {
                                 match zone {
                                     FooterZone::Actions => self.show_actions_zone(ui),
+                                    FooterZone::Rename => self.show_rename_editor(ui),
                                     FooterZone::Permissions => self.show_permission_editor(ui),
                                     FooterZone::Progress => self.show_progress_zone(ui),
                                 }
                             }
+                            ui.add_space(1.0);
                         });
+                    // Feeds `strip_height` above, next frame — see
+                    // `strip_measured_height`'s doc comment.
+                    self.strip_measured_height = scroll_output.content_size.y;
                     self.actions_strip_rect = Some(strip_rect);
                 } else {
                     self.actions_strip_rect = None;
@@ -1588,6 +1974,10 @@ impl eframe::App for BrowDeckApp {
             }
         });
         self.central_rect = Some(central_resp.response.rect);
+
+        if self.quit_confirm {
+            self.show_quit_confirm(ui.ctx());
+        }
     }
 }
 
@@ -1600,7 +1990,8 @@ impl BrowDeckApp {
         ui.heading("Places");
         let mut clicked_place = None;
         for place in &self.places {
-            let r = ui.selectable_label(false, (self.icon(place.icon), place.label.as_str()));
+            let r =
+                ui.selectable_label(false, (self.icon_scaled(place.icon), place.label.as_str()));
             if self.scroll_to_focus == Some(r.id) {
                 r.scroll_to_me(Some(egui::Align::Center));
                 self.scroll_to_focus = None;
@@ -1625,7 +2016,10 @@ impl BrowDeckApp {
         for mount in visible_mounts {
             let mount_label = mount.mount_point.to_string_lossy().into_owned();
             let response = ui
-                .selectable_label(false, (self.icon(mount.icon()), mount_label.as_str()))
+                .selectable_label(
+                    false,
+                    (self.icon_scaled(mount.icon()), mount_label.as_str()),
+                )
                 .on_hover_text(&mount.device);
             if self.scroll_to_focus == Some(response.id) {
                 response.scroll_to_me(Some(egui::Align::Center));
@@ -1643,7 +2037,7 @@ impl BrowDeckApp {
         ui.add_space(8.0);
         let trash_row = ui.selectable_label(
             matches!(self.view, View::Trash),
-            (self.icon(ICON_DELETE), "Trash"),
+            (self.icon_scaled(ICON_DELETE), "Trash"),
         );
         sidebar_ids.push(trash_row.id);
         if trash_row.clicked() {
@@ -1695,7 +2089,7 @@ impl BrowDeckApp {
     fn show_dir(&mut self, ui: &mut egui::Ui) {
         if self.search_open {
             ui.horizontal(|ui| {
-                ui.label(self.icon(ICON_SEARCH));
+                ui.label(self.icon_scaled(ICON_SEARCH));
                 let search_resp = ui.add(
                     egui::TextEdit::singleline(&mut self.search_query)
                         .hint_text("Search this folder…")
@@ -1710,7 +2104,7 @@ impl BrowDeckApp {
                     self.recursive_spinner_shown = false;
                 }
                 let recursive_toggle = ui
-                    .selectable_label(self.recursive_search, self.icon(ICON_ACCOUNT_TREE))
+                    .selectable_label(self.recursive_search, self.icon_scaled(ICON_ACCOUNT_TREE))
                     .on_hover_text("Also search subfolders");
                 if recursive_toggle.clicked() {
                     self.recursive_search = !self.recursive_search;
@@ -1718,7 +2112,7 @@ impl BrowDeckApp {
                     self.recursive_spinner_shown = false;
                 }
                 if ui
-                    .button(self.icon(ICON_CLOSE))
+                    .button(self.icon_scaled(ICON_CLOSE))
                     .on_hover_text("Close search")
                     .clicked()
                 {
@@ -1730,7 +2124,7 @@ impl BrowDeckApp {
                 }
             });
         } else if ui
-            .button(self.icon(ICON_SEARCH))
+            .button(self.icon_scaled(ICON_SEARCH))
             .on_hover_text("Search this folder")
             .clicked()
         {
@@ -1793,18 +2187,16 @@ impl BrowDeckApp {
                     {
                         continue;
                     }
-                    let icon = if entry.is_dir {
-                        ICON_FOLDER
-                    } else {
-                        ICON_DESCRIPTION
-                    };
+                    let icon = fileicons::icon_for(&entry.path, entry.is_dir);
                     let is_selected = if self.multi_select {
                         self.multi_selected.contains(&entry.path)
                     } else {
                         self.selected.as_deref() == Some(entry.path.as_path())
                     };
-                    let response =
-                        ui.selectable_label(is_selected, (self.icon(icon), entry.name.as_str()));
+                    let response = ui.selectable_label(
+                        is_selected,
+                        (self.icon_scaled(icon), entry.name.as_str()),
+                    );
                     if self.scroll_to_focus == Some(response.id) {
                         response.scroll_to_me(Some(egui::Align::Center));
                         self.scroll_to_focus = None;
@@ -1879,8 +2271,10 @@ impl BrowDeckApp {
                         entry.original_path.to_string_lossy()
                     );
                     let is_selected = self.selected_trash == Some(i);
-                    let response = ui
-                        .selectable_label(is_selected, (self.icon(ICON_RESTORE_FROM_TRASH), label));
+                    let response = ui.selectable_label(
+                        is_selected,
+                        (self.icon_scaled(ICON_RESTORE_FROM_TRASH), label),
+                    );
                     if self.scroll_to_focus == Some(response.id) {
                         response.scroll_to_me(Some(egui::Align::Center));
                         self.scroll_to_focus = None;
@@ -2003,7 +2397,7 @@ impl BrowDeckApp {
         let mut first_id = None;
         let mut row_ids: Vec<egui::Id> = Vec::new();
         ui.horizontal_wrapped(|ui| {
-            let close = Self::action_badge(ui, self.icon(ICON_CLOSE));
+            let close = Self::action_badge(self.badge_min_height(), ui, self.icon(ICON_CLOSE));
             row_ids.push(close.id);
             if close.clicked() {
                 self.context_menu_open = false;
@@ -2020,7 +2414,11 @@ impl BrowDeckApp {
             }
             ui.separator();
             if self.clipboard.is_some() && self.jobs.is_empty() {
-                let r = Self::action_badge(ui, (self.icon(ICON_CONTENT_PASTE), "Paste"));
+                let r = Self::action_badge(
+                    self.badge_min_height(),
+                    ui,
+                    (self.icon(ICON_CONTENT_PASTE), "Paste"),
+                );
                 first_id.get_or_insert(r.id);
                 row_ids.push(r.id);
                 if r.clicked() {
@@ -2029,10 +2427,52 @@ impl BrowDeckApp {
                     // stacks below Actions rather than replacing it.
                 }
             }
+            let r = Self::action_badge(
+                self.badge_min_height(),
+                ui,
+                (self.icon(ICON_CREATE_NEW_FOLDER), "New Folder"),
+            );
+            first_id.get_or_insert(r.id);
+            row_ids.push(r.id);
+            if r.clicked() {
+                self.rename_editor = Some(RenameEditor {
+                    target: None,
+                    text: "New Folder".to_string(),
+                });
+                self.focus_first_action = true;
+                // Deliberately left open: the rename/new-folder zone
+                // stacks below Actions rather than replacing it.
+            }
+            if let Some(path) = &single {
+                let r = Self::action_badge(
+                    self.badge_min_height(),
+                    ui,
+                    (self.icon(ICON_DRIVE_FILE_RENAME_OUTLINE), "Rename"),
+                );
+                first_id.get_or_insert(r.id);
+                row_ids.push(r.id);
+                if r.clicked() {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                    self.rename_editor = Some(RenameEditor {
+                        target: Some(path.clone()),
+                        text: name,
+                    });
+                    self.focus_first_action = true;
+                    // Deliberately left open: the rename/new-folder zone
+                    // stacks below Actions rather than replacing it.
+                }
+            }
             if let Some(path) = &single
                 && !path.is_dir()
             {
-                let r = Self::action_badge(ui, (self.icon(ICON_OPEN_IN_NEW), "Open"));
+                let r = Self::action_badge(
+                    self.badge_min_height(),
+                    ui,
+                    (self.icon(ICON_OPEN_IN_NEW), "Open"),
+                );
                 first_id.get_or_insert(r.id);
                 row_ids.push(r.id);
                 if r.clicked() {
@@ -2041,7 +2481,11 @@ impl BrowDeckApp {
                 }
             }
             if !paths.is_empty() {
-                let r = Self::action_badge(ui, (self.icon(ICON_CONTENT_COPY), "Copy"));
+                let r = Self::action_badge(
+                    self.badge_min_height(),
+                    ui,
+                    (self.icon(ICON_CONTENT_COPY), "Copy"),
+                );
                 first_id.get_or_insert(r.id);
                 row_ids.push(r.id);
                 if r.clicked() {
@@ -2051,7 +2495,11 @@ impl BrowDeckApp {
                     });
                     self.context_menu_open = false;
                 }
-                let r = Self::action_badge(ui, (self.icon(ICON_CONTENT_CUT), "Cut"));
+                let r = Self::action_badge(
+                    self.badge_min_height(),
+                    ui,
+                    (self.icon(ICON_CONTENT_CUT), "Cut"),
+                );
                 first_id.get_or_insert(r.id);
                 row_ids.push(r.id);
                 if r.clicked() {
@@ -2061,7 +2509,11 @@ impl BrowDeckApp {
                     });
                     self.context_menu_open = false;
                 }
-                let r = Self::action_badge(ui, (self.icon(ICON_DELETE), "Delete"));
+                let r = Self::action_badge(
+                    self.badge_min_height(),
+                    ui,
+                    (self.icon(ICON_DELETE), "Delete"),
+                );
                 first_id.get_or_insert(r.id);
                 row_ids.push(r.id);
                 if r.clicked() {
@@ -2073,7 +2525,11 @@ impl BrowDeckApp {
                 && fileops::is_archive(path)
                 && self.jobs.is_empty()
             {
-                let r = Self::action_badge(ui, (self.icon(ICON_UNARCHIVE), "Extract"));
+                let r = Self::action_badge(
+                    self.badge_min_height(),
+                    ui,
+                    (self.icon(ICON_UNARCHIVE), "Extract"),
+                );
                 first_id.get_or_insert(r.id);
                 row_ids.push(r.id);
                 if r.clicked() {
@@ -2085,7 +2541,11 @@ impl BrowDeckApp {
                 }
             }
             if !paths.is_empty() {
-                let r = Self::action_badge(ui, (self.icon(ICON_LOCK), "Permissions"));
+                let r = Self::action_badge(
+                    self.badge_min_height(),
+                    ui,
+                    (self.icon(ICON_LOCK), "Permissions"),
+                );
                 first_id.get_or_insert(r.id);
                 row_ids.push(r.id);
                 // Multi-selection: applies one mode to every selected
@@ -2110,10 +2570,18 @@ impl BrowDeckApp {
                 && self.iprolaunch_bin.is_some()
             {
                 if self.iprolaunch_registered(path) {
-                    Self::action_badge_disabled(ui, (self.icon(ICON_CHECK_CIRCLE), "IProLaunch"))
-                        .on_hover_text("Already in the IProLaunch library");
+                    Self::action_badge_disabled(
+                        self.badge_min_height(),
+                        ui,
+                        (self.icon(ICON_CHECK_CIRCLE), "IProLaunch"),
+                    )
+                    .on_hover_text("Already in the IProLaunch library");
                 } else {
-                    let r = Self::action_badge(ui, (self.icon(ICON_ROCKET_LAUNCH), "IProLaunch"));
+                    let r = Self::action_badge(
+                        self.badge_min_height(),
+                        ui,
+                        (self.icon(ICON_ROCKET_LAUNCH), "IProLaunch"),
+                    );
                     first_id.get_or_insert(r.id);
                     row_ids.push(r.id);
                     if r.clicked() {
@@ -2127,7 +2595,15 @@ impl BrowDeckApp {
             }
         });
         self.right_focus_rows.push(row_ids);
+        // Skip if Permissions/Rename was *just* opened by a click above:
+        // `active_zones` was computed once, before this render, so that
+        // new zone won't actually render (and consume `focus_first_action`
+        // itself) until next frame — if this check didn't defer to it,
+        // Actions' own `first_id` would steal the flag first, focusing
+        // the wrong badge instead of the new zone's own first widget.
         if self.focus_first_action
+            && self.perm_editor.is_none()
+            && self.rename_editor.is_none()
             && let Some(id) = first_id
         {
             ui.ctx().memory_mut(|m| m.request_focus(id));
@@ -2139,7 +2615,7 @@ impl BrowDeckApp {
         let mut first_id = None;
         let mut row_ids: Vec<egui::Id> = Vec::new();
         ui.horizontal_wrapped(|ui| {
-            let close = Self::action_badge(ui, self.icon(ICON_CLOSE));
+            let close = Self::action_badge(self.badge_min_height(), ui, self.icon(ICON_CLOSE));
             row_ids.push(close.id);
             if close.clicked() {
                 self.context_menu_open = false;
@@ -2147,7 +2623,11 @@ impl BrowDeckApp {
             ui.strong("Actions");
             ui.separator();
             if let Some(i) = self.selected_trash {
-                let r = Self::action_badge(ui, (self.icon(ICON_RESTORE_FROM_TRASH), "Restore"));
+                let r = Self::action_badge(
+                    self.badge_min_height(),
+                    ui,
+                    (self.icon(ICON_RESTORE_FROM_TRASH), "Restore"),
+                );
                 first_id.get_or_insert(r.id);
                 row_ids.push(r.id);
                 if r.clicked() {
@@ -2160,7 +2640,11 @@ impl BrowDeckApp {
                 }
             }
             if !self.trash_entries.is_empty() {
-                let r = Self::action_badge(ui, (self.icon(ICON_DELETE_SWEEP), "Empty All"));
+                let r = Self::action_badge(
+                    self.badge_min_height(),
+                    ui,
+                    (self.icon(ICON_DELETE_SWEEP), "Empty All"),
+                );
                 first_id.get_or_insert(r.id);
                 row_ids.push(r.id);
                 if r.clicked() {
@@ -2182,6 +2666,164 @@ impl BrowDeckApp {
         }
     }
 
+    /// Both "Rename" (`target: Some(path)`) and "New Folder"
+    /// (`target: None`, creates in `current_dir`) — one text field, one
+    /// zone, differing only in what Apply does and the label/hint text.
+    ///
+    /// The name field itself is only a real, focusable `TextEdit` while
+    /// `rename_editing` is true; otherwise it renders as an ordinary
+    /// `action_badge` showing the current text, navigable by d-pad like
+    /// any other badge. This two-stage design (press A to start
+    /// editing, B to stop) exists because a `TextEdit` that has genuine
+    /// egui keyboard focus is exactly what Steam Input watches for to
+    /// start routing the physical d-pad/left-stick into text-cursor
+    /// movement — if the field were auto-focused the instant this zone
+    /// opened (the old behavior), the very next d-pad press moved the
+    /// text cursor instead of navigating to another badge, with no way
+    /// to tell which one would happen.
+    fn show_rename_editor(&mut self, ui: &mut egui::Ui) {
+        let Some(editor) = &mut self.rename_editor else {
+            return;
+        };
+        let is_new_folder = editor.target.is_none();
+        let target = editor.target.clone();
+        // Taken, not cloned, and put back after the row closure — the
+        // `TextEdit` needs `&mut` on the live field, but the closure also
+        // needs `&mut self` for `self.icon(...)`/`row_ids`/etc., and
+        // borrowing `self.rename_editor` mutably for the whole closure
+        // would conflict with that.
+        let mut text = std::mem::take(&mut editor.text);
+        let mut apply = false;
+        let mut cancel = false;
+        let mut first_id = None;
+        let mut row_ids: Vec<egui::Id> = Vec::new();
+        let editing = self.rename_editing;
+        // Captured *before* the row below can set it — a click on the
+        // field badge (inside that row, further down) also sets
+        // `rename_focus_pending`, but that means "focus the real
+        // `TextEdit` next frame, once it exists", not this one (this
+        // frame already committed to drawing the badge, since `editing`
+        // above was read before the click happens). Only a flag that was
+        // already true *coming into* this frame — e.g. set by the B-exits-
+        // editing handler in the gamepad dispatch loop, which runs earlier
+        // in the same frame — should be consumed by this frame's render.
+        let focus_pending = self.rename_focus_pending;
+        let mut field_id = None;
+        ui.horizontal_wrapped(|ui| {
+            let close = Self::action_badge(self.badge_min_height(), ui, self.icon(ICON_CLOSE));
+            row_ids.push(close.id);
+            if close.clicked() {
+                cancel = true;
+            }
+            ui.strong(if is_new_folder {
+                "New Folder"
+            } else {
+                "Rename"
+            });
+            ui.separator();
+            if editing {
+                let text_resp = ui.add(
+                    egui::TextEdit::singleline(&mut text)
+                        .hint_text("Name")
+                        .desired_width(220.0),
+                );
+                field_id = Some(text_resp.id);
+                row_ids.push(text_resp.id);
+                if text_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    apply = true;
+                }
+            } else {
+                let label = if text.is_empty() {
+                    "Name".to_string()
+                } else {
+                    text.clone()
+                };
+                let field = Self::action_badge(self.badge_min_height(), ui, label)
+                    .on_hover_text("Press A (or click) to edit the name");
+                first_id.get_or_insert(field.id);
+                field_id = Some(field.id);
+                row_ids.push(field.id);
+                if field.clicked() {
+                    self.rename_editing = true;
+                    self.rename_focus_pending = true;
+                }
+            }
+            ui.separator();
+            let apply_btn = Self::action_badge(
+                self.badge_min_height(),
+                ui,
+                if is_new_folder { "Create" } else { "Rename" },
+            );
+            row_ids.push(apply_btn.id);
+            if apply_btn.clicked() {
+                apply = true;
+            }
+            let cancel_btn = Self::action_badge(self.badge_min_height(), ui, "Cancel");
+            row_ids.push(cancel_btn.id);
+            if cancel_btn.clicked() {
+                cancel = true;
+            }
+        });
+        self.right_focus_rows.push(row_ids);
+        if focus_pending && let Some(id) = field_id {
+            self.set_focus(ui.ctx(), id);
+            self.rename_focus_pending = false;
+        }
+        let trimmed = text.trim().to_string();
+        if let Some(editor) = &mut self.rename_editor {
+            editor.text = text;
+        }
+        if apply && trimmed.is_empty() {
+            eprintln!("name can't be empty");
+        } else if apply {
+            match &target {
+                Some(old_path) => {
+                    let new_path = old_path.with_file_name(&trimmed);
+                    if new_path.exists() {
+                        eprintln!("rename failed: {} already exists", new_path.display());
+                    } else if let Err(e) = std::fs::rename(old_path, &new_path) {
+                        eprintln!("rename failed: {e}");
+                    } else {
+                        if self.selected.as_deref() == Some(old_path.as_path()) {
+                            self.set_selected(Some(new_path));
+                        }
+                        self.rename_editor = None;
+                        self.context_menu_open = false;
+                        self.refresh();
+                    }
+                }
+                None => {
+                    let new_dir = self.current_dir.join(&trimmed);
+                    if let Err(e) = std::fs::create_dir(&new_dir) {
+                        eprintln!("create folder failed: {e}");
+                    } else {
+                        self.rename_editor = None;
+                        self.context_menu_open = false;
+                        self.refresh();
+                        self.set_selected(Some(new_dir));
+                    }
+                }
+            }
+        } else if cancel {
+            self.rename_editor = None;
+        }
+        // Covers every path above that can close the zone (apply success,
+        // cancel) in one place, including a mouse click on Close/Cancel
+        // while mid-edit — without this, a stale `true` here would make
+        // the *next* Rename/New Folder open straight into edit mode again,
+        // exactly the auto-focus behavior this whole two-stage design
+        // exists to avoid.
+        if self.rename_editor.is_none() {
+            self.rename_editing = false;
+        }
+        if self.focus_first_action
+            && let Some(id) = first_id
+        {
+            ui.ctx().memory_mut(|m| m.request_focus(id));
+            self.focus_first_action = false;
+        }
+    }
+
     fn show_permission_editor(&mut self, ui: &mut egui::Ui) {
         let Some(editor) = &mut self.perm_editor else {
             return;
@@ -2193,7 +2835,7 @@ impl BrowDeckApp {
         let mut first_id = None;
         let mut row_ids: Vec<egui::Id> = Vec::new();
         ui.horizontal_wrapped(|ui| {
-            let close = Self::action_badge(ui, self.icon(ICON_CLOSE));
+            let close = Self::action_badge(self.badge_min_height(), ui, self.icon(ICON_CLOSE));
             row_ids.push(close.id);
             if close.clicked() {
                 cancel = true;
@@ -2226,13 +2868,13 @@ impl BrowDeckApp {
                 }
             }
             ui.separator();
-            let apply_btn = Self::action_badge(ui, "Apply");
+            let apply_btn = Self::action_badge(self.badge_min_height(), ui, "Apply");
             first_id.get_or_insert(apply_btn.id);
             row_ids.push(apply_btn.id);
             if apply_btn.clicked() {
                 apply = true;
             }
-            let cancel_btn = Self::action_badge(ui, "Cancel");
+            let cancel_btn = Self::action_badge(self.badge_min_height(), ui, "Cancel");
             row_ids.push(cancel_btn.id);
             if cancel_btn.clicked() {
                 cancel = true;
@@ -2276,5 +2918,69 @@ impl BrowDeckApp {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(name: &str, is_dir: bool, size: u64, modified_secs: u64) -> Entry {
+        Entry {
+            name: name.to_string(),
+            path: PathBuf::from(name),
+            is_dir,
+            size,
+            modified: Some(std::time::UNIX_EPOCH + Duration::from_secs(modified_secs)),
+        }
+    }
+
+    #[test]
+    fn dirs_always_sort_before_files_regardless_of_criteria_or_direction() {
+        let dir = entry("zzz_dir", true, 999, 0);
+        let file = entry("aaa_file", false, 1, 100);
+        for sort_by in [SortBy::Name, SortBy::Size, SortBy::Modified] {
+            for ascending in [true, false] {
+                assert_eq!(
+                    compare_entries(&dir, &file, sort_by, ascending),
+                    std::cmp::Ordering::Less
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sorts_by_size_within_files() {
+        let small = entry("a", false, 10, 0);
+        let big = entry("b", false, 100, 0);
+        assert_eq!(
+            compare_entries(&small, &big, SortBy::Size, true),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_entries(&small, &big, SortBy::Size, false),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn sorts_by_modified_within_files() {
+        let older = entry("a", false, 0, 100);
+        let newer = entry("b", false, 0, 200);
+        assert_eq!(
+            compare_entries(&older, &newer, SortBy::Modified, true),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_entries(&older, &newer, SortBy::Modified, false),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn sort_by_cycles_through_all_three_and_back() {
+        assert_eq!(SortBy::Name.next(), SortBy::Size);
+        assert_eq!(SortBy::Size.next(), SortBy::Modified);
+        assert_eq!(SortBy::Modified.next(), SortBy::Name);
     }
 }

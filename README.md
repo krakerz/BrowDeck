@@ -1,3 +1,5 @@
+![BrowDeck screenshot](docs/screenshot.png)
+
 # BrowDeck
 
 A gamepad-first file browser for Linux, built for Steam gamemode / gamescope.
@@ -17,15 +19,24 @@ and getting blurred.
   pane (sidebar, file list, actions/preview, toolbar) is focused; LB/RB
   switches between panes
 - Copy, cut, delete (to trash), extract (`.zip`/`.tar`/`.tar.gz`/`.tgz`),
-  and change permissions, all from a button-driven actions panel
+  rename/new folder, and change permissions (single file or a whole
+  multi-selection at once), all from a button-driven actions panel
 - Multi-select for batch operations
 - Sidebar: XDG places (Home/Desktop/Documents/…), real block-device mounts
-  with USB/microSD detection, and a trash view with restore/empty
+  with USB/microSD detection, a trash view with restore/empty, and an info
+  card (owner/group/size/permissions/link target) for the current selection
+- Sort the file list by name, size, or modified date, ascending or
+  descending
+- Mimetype-aware file icons (archives, images, audio, video, PDFs, code,
+  fonts, …), not just generic file/folder icons
 - Quick preview pane for images and text files
 - Show/hide hidden files toggle (hidden by default)
 - In-folder search, with an optional recursive (subfolder) mode
-- Material Design icons with an adjustable icon scale
+- Material Design icons; LT/RT adjusts the scale of the sidebar and main
+  pane specifically (toolbar/strip/preview stay a fixed size)
 - CJK (Japanese/Chinese/Korean) filename rendering
+- Hold Start for 3s to quit, with a Yes/Cancel confirmation — no keyboard
+  Alt+F4 to rely on under gamescope/Game Mode
 - Optional IProLaunch integration — an "Add to IProLaunch" action appears
   for `.exe`/`.bat` files when IProLaunch is installed
 
@@ -49,9 +60,13 @@ cargo build --release
 ./target/release/browdeck
 ```
 
-Fullscreen/windowed mode and resolution are configurable via
-`$XDG_CONFIG_HOME/browdeck/config.toml` (defaults to fullscreen at the
-display's native resolution).
+BrowDeck writes `$XDG_CONFIG_HOME/browdeck/config.toml` (falling back to
+`~/.config/browdeck/config.toml`) itself the first time it runs with none
+present, with sane defaults already set — fullscreen at the display's
+native resolution, and a thin title header above the toolbar (there to
+keep the toolbar's icons clear of Steam/gamescope's own performance
+overlay) both on. Edit it to go windowed, change the resolution, or turn
+the header off; see `config/config.example.toml` for every available key.
 
 ## Usage
 
@@ -67,9 +82,10 @@ Navigate with the d-pad or left stick; the right stick moves the selection
 | Y (hold)  | Search                                      |
 | L3        | Toggle multi-select                         |
 | R3        | Open the selected item                      |
-| Start     | Open the selected item                      |
+| Start (tap)  | Open the selected item                   |
+| Start (hold) | Quit (asks for Yes/Cancel confirmation)  |
 | Select    | Toggle preview pane width                   |
-| LB / RB   | Switch pane (Sidebar / main list / Toolbar) |
+| LB / RB   | Switch pane (Sidebar / main list / Preview / Toolbar) |
 | LT / RT   | Icon scale down / up                        |
 
 Everything is also reachable with a mouse and keyboard.
@@ -82,8 +98,9 @@ upscale/blur the result is the exact gamescope behavior this project exists
 to avoid.
 
 **Does it work without a gamepad?**
-Yes — mouse and keyboard work throughout; the gamepad button legend only
-appears in the status bar when a controller is actually connected.
+Yes — mouse and keyboard work throughout. The status bar's button legend
+always shows, connected or not, since it doubles as a reference for the
+mouse/keyboard equivalents.
 
 **Does it follow symlinks?**
 Directory listings and navigation follow symlinks; the recursive search
