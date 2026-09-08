@@ -1,10 +1,11 @@
 use crate::{deleted, fileops, fonts, gamepad, mounts, permissions, places, preview};
 use egui_material_icons::MaterialIcon;
 use egui_material_icons::icons::{
-    ICON_ARROW_UPWARD, ICON_CLOSE, ICON_CONTENT_COPY, ICON_CONTENT_CUT, ICON_CONTENT_PASTE,
-    ICON_DELETE, ICON_DELETE_SWEEP, ICON_DESCRIPTION, ICON_FOLDER, ICON_GAMEPAD, ICON_LOCK,
-    ICON_MENU, ICON_OPEN_IN_NEW, ICON_PREVIEW, ICON_REFRESH, ICON_RESTORE_FROM_TRASH, ICON_SEARCH,
-    ICON_UNARCHIVE, ICON_ZOOM_IN, ICON_ZOOM_OUT,
+    ICON_ACCOUNT_TREE, ICON_ARROW_UPWARD, ICON_CLOSE, ICON_CONTENT_COPY, ICON_CONTENT_CUT,
+    ICON_CONTENT_PASTE, ICON_DELETE, ICON_DELETE_SWEEP, ICON_DESCRIPTION, ICON_FOLDER,
+    ICON_GAMEPAD, ICON_LOCK, ICON_MENU, ICON_OPEN_IN_NEW, ICON_PREVIEW, ICON_REFRESH,
+    ICON_RESTORE_FROM_TRASH, ICON_SEARCH, ICON_UNARCHIVE, ICON_VISIBILITY, ICON_VISIBILITY_OFF,
+    ICON_ZOOM_IN, ICON_ZOOM_OUT,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -37,12 +38,17 @@ enum View {
     Trash,
 }
 
-/// Which of the three left-to-right panes currently holds keyboard focus —
-/// used only to draw a highlight border for gamepad/keyboard navigation.
+/// Which pane currently holds keyboard focus. `Sidebar`/`Active`/`Toolbar`
+/// are the three sections LB/RB cycle between (see `pane_cycle`); `Right`
+/// (preview/actions/permissions/progress) is reached only via explicit
+/// triggers (X, R3, the Permissions button, …), not the LB/RB cycle, but
+/// still gets its own highlight and dpad/stick input stays confined to it
+/// like any other pane while it's focused.
 #[derive(Clone, Copy, PartialEq)]
 enum Pane {
     Sidebar,
-    FileList,
+    Active,
+    Toolbar,
     Right,
 }
 
@@ -75,17 +81,63 @@ pub struct BrowDeckApp {
     /// One-shot flags consumed the next time the relevant widget is drawn.
     focus_search: bool,
     focus_first_action: bool,
-    /// The hamburger button's id, refreshed every frame, so the gamepad's
-    /// "Select" button can jump focus straight to the toolbar.
+    /// The hamburger button's id — last-resort fallback focus target when
+    /// nothing else is available.
     top_focus_id: egui::Id,
     /// Last frame's pane rects, used to classify the currently-focused
     /// widget into a pane (one-frame-stale, imperceptible in practice).
     sidebar_rect: Option<egui::Rect>,
     central_rect: Option<egui::Rect>,
     right_rect: Option<egui::Rect>,
+    toolbar_rect: Option<egui::Rect>,
     /// Ids of last frame's file-list rows paired with their path — used to
-    /// look up which entry is focused when toggling multi-select.
+    /// look up which entry is focused when toggling multi-select, and to
+    /// confine d-pad/stick movement to the Active pane.
     entry_ids: Vec<(egui::Id, PathBuf)>,
+    /// Same idea as `entry_ids`, for the Trash view's rows.
+    trash_ids: Vec<egui::Id>,
+    /// Ids of last frame's sidebar rows (places, then mounts, then Trash),
+    /// in visual top-to-bottom order — confines d-pad/stick movement to
+    /// the Sidebar pane.
+    sidebar_ids: Vec<egui::Id>,
+    /// Ids of last frame's toolbar buttons, in visual left-to-right order —
+    /// confines d-pad/stick movement to the Toolbar pane.
+    toolbar_ids: Vec<egui::Id>,
+    /// The last focused widget id seen in each pane, remembered so
+    /// switching panes (LB/RB) restores the cursor to "where you left off"
+    /// instead of landing nowhere.
+    sidebar_last_focus: Option<egui::Id>,
+    active_last_focus: Option<egui::Id>,
+    toolbar_last_focus: Option<egui::Id>,
+    right_last_focus: Option<egui::Id>,
+    /// Set alongside every programmatic `request_focus` so the newly
+    /// focused row can scroll itself into view the next time it's drawn
+    /// (egui doesn't do this on its own) — consumed and cleared by
+    /// whichever list draws a row matching this id.
+    scroll_to_focus: Option<egui::Id>,
+    /// The right stick's per-frame scroll delta (points), reset to `None`
+    /// every frame and applied by whichever pane's `ScrollArea` currently
+    /// has focus via `Ui::scroll_with_delta` — see NOTES.md "gamepad
+    /// scrolling needs `scroll_with_delta`, not a fake pointer hover" for
+    /// why a synthetic `MouseWheel` event alone doesn't work.
+    pending_scroll: Option<f32>,
+    /// Whether the in-folder search also walks subfolders, not just the
+    /// current directory.
+    recursive_search: bool,
+    /// Cached results of the last recursive walk — recomputed only when
+    /// the query/toggle actually changes (see `recursive_dirty`), since
+    /// the walk itself is synchronous and can be slow on a large tree.
+    recursive_results: Vec<Entry>,
+    /// True from the moment the query/toggle changes until the walk that
+    /// answers it has run. Consumed over two frames on purpose — see
+    /// NOTES.md "recursive search runs synchronously, not threaded" — so
+    /// a "Searching…" spinner gets a real frame on screen before the
+    /// (blocking) walk happens, instead of the UI just freezing with no
+    /// feedback.
+    recursive_dirty: bool,
+    /// Set on the first frame `recursive_dirty` is seen — the walk runs
+    /// on the *next* frame after this is already true, not immediately.
+    recursive_spinner_shown: bool,
     multi_select: bool,
     multi_selected: std::collections::HashSet<PathBuf>,
 }
@@ -129,7 +181,21 @@ impl BrowDeckApp {
             sidebar_rect: None,
             central_rect: None,
             right_rect: None,
+            toolbar_rect: None,
             entry_ids: Vec::new(),
+            trash_ids: Vec::new(),
+            sidebar_ids: Vec::new(),
+            toolbar_ids: Vec::new(),
+            sidebar_last_focus: None,
+            active_last_focus: None,
+            toolbar_last_focus: None,
+            right_last_focus: None,
+            scroll_to_focus: None,
+            pending_scroll: None,
+            recursive_search: false,
+            recursive_results: Vec::new(),
+            recursive_dirty: false,
+            recursive_spinner_shown: false,
             multi_select: false,
             multi_selected: std::collections::HashSet::new(),
         };
@@ -181,6 +247,9 @@ impl BrowDeckApp {
         self.current_dir = dir;
         self.view = View::Dir;
         self.search_query.clear();
+        self.recursive_results.clear();
+        self.recursive_dirty = false;
+        self.recursive_spinner_shown = false;
         self.set_selected(None);
         self.refresh();
     }
@@ -201,6 +270,52 @@ impl BrowDeckApp {
             .collect();
         entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
         self.entries = entries;
+    }
+
+    /// Walks `current_dir` recursively looking for entries (at any depth)
+    /// whose name contains `query`. Runs synchronously on the UI thread —
+    /// see NOTES.md "recursive search runs synchronously, not threaded" —
+    /// so both how much it scans and how many results it keeps are capped
+    /// to bound the worst case on a huge tree (`~/.cache`, node_modules,
+    /// etc.). Never follows symlinked directories, to avoid an infinite
+    /// loop from one that points back at an ancestor.
+    fn recursive_search(&self, query: &str) -> Vec<Entry> {
+        const MAX_SCANNED: usize = 20_000;
+        const MAX_RESULTS: usize = 500;
+
+        let mut results = Vec::new();
+        let mut scanned = 0usize;
+        let mut stack = vec![self.current_dir.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(read_dir) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in read_dir.flatten() {
+                if scanned >= MAX_SCANNED || results.len() >= MAX_RESULTS {
+                    return results;
+                }
+                scanned += 1;
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let is_dir = path.is_dir();
+                if name.to_lowercase().contains(query) {
+                    let display = path
+                        .strip_prefix(&self.current_dir)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .into_owned();
+                    results.push(Entry {
+                        name: display,
+                        path: path.clone(),
+                        is_dir,
+                    });
+                }
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    stack.push(path);
+                }
+            }
+        }
+        results
     }
 
     fn open_trash(&mut self) {
@@ -275,21 +390,161 @@ impl BrowDeckApp {
     /// it only intervenes when gamepad nav is actually about to be used —
     /// never on an idle frame, where it would otherwise keep fighting a
     /// mouse-driven selection that never set keyboard focus to begin with.
-    fn ensure_focus_anchor(&self, ctx: &egui::Context) {
+    fn ensure_focus_anchor(&mut self, ctx: &egui::Context) {
         if ctx.memory(|m| m.focused()).is_none() {
             // Prefer whatever's already selected (typically via mouse,
             // which doesn't grant egui keyboard focus on its own — see
             // NOTES.md) so a first d-pad/stick nudge continues on from
             // there instead of jumping to the top of the pane, which read
             // as the selection itself moving.
+            let active_ids = self.pane_ids(Pane::Active);
             let fallback = self
                 .selected
                 .as_ref()
                 .and_then(|sel| self.entry_ids.iter().find(|(_, p)| p == sel))
-                .or_else(|| self.entry_ids.first())
                 .map(|(id, _)| *id)
+                .or_else(|| active_ids.first().copied())
                 .unwrap_or(self.top_focus_id);
-            ctx.memory_mut(|m| m.request_focus(fallback));
+            self.set_focus(ctx, fallback);
+        }
+    }
+
+    /// Gives a widget keyboard focus *and* marks it to be scrolled into
+    /// view the next time it's drawn — every programmatic focus change
+    /// should go through this, not `ctx.memory_mut(|m| m.request_focus(..))`
+    /// directly, or the newly focused row can end up off-screen with no
+    /// way to tell (see NOTES.md, "programmatic focus needs to scroll
+    /// itself into view too").
+    fn set_focus(&mut self, ctx: &egui::Context, id: egui::Id) {
+        ctx.memory_mut(|m| m.request_focus(id));
+        self.scroll_to_focus = Some(id);
+    }
+
+    /// The ids of the currently-navigable widgets in a pane, in visual
+    /// order — the set d-pad/stick movement is confined to while that pane
+    /// has focus, and what LB/RB land on when switching into it.
+    /// Only meaningful for Sidebar/Active/Toolbar — see [`Self::move_focus_confined`]
+    /// for why Right isn't included.
+    fn pane_ids(&self, pane: Pane) -> Vec<egui::Id> {
+        match pane {
+            Pane::Sidebar => self.sidebar_ids.clone(),
+            Pane::Active => match self.view {
+                View::Dir => self.entry_ids.iter().map(|(id, _)| *id).collect(),
+                View::Trash => self.trash_ids.clone(),
+            },
+            Pane::Toolbar => self.toolbar_ids.clone(),
+            Pane::Right => Vec::new(),
+        }
+    }
+
+    /// Moves focus by one step within whichever pane currently has it,
+    /// never letting a direction press leave that pane (that's LB/RB's
+    /// job now, see [`Self::switch_pane`]). Sidebar/Active are vertical
+    /// lists (Up/Down move; Left/Right are no-ops); Toolbar is a
+    /// horizontal row (the reverse). Right pane's content shape varies too
+    /// much (button rows, a permission grid, progress bars) for a single
+    /// flat order to make sense, so it keeps using egui's own geometric
+    /// search — its contents are small/self-contained enough in practice
+    /// that this hasn't been observed to leak into neighboring panes.
+    fn move_focus_confined(&mut self, ctx: &egui::Context, dir: egui::FocusDirection) {
+        let Some(pane) = self.focused_pane(ctx) else {
+            // No pane classified yet (e.g. focus landed somewhere odd) —
+            // fall back to egui's own geometric search rather than doing
+            // nothing.
+            ctx.memory_mut(|m| m.move_focus(dir));
+            return;
+        };
+        if pane == Pane::Right {
+            ctx.memory_mut(|m| m.move_focus(dir));
+            return;
+        }
+        let delta: isize = match (pane, dir) {
+            (Pane::Toolbar, egui::FocusDirection::Right) => 1,
+            (Pane::Toolbar, egui::FocusDirection::Left) => -1,
+            (Pane::Toolbar, _) => 0,
+            (_, egui::FocusDirection::Down) => 1,
+            (_, egui::FocusDirection::Up) => -1,
+            (_, _) => 0,
+        };
+        if delta == 0 {
+            return;
+        }
+        let ids = self.pane_ids(pane);
+        let current = ctx.memory(|m| m.focused());
+        let idx = current.and_then(|id| ids.iter().position(|i| *i == id));
+        let next = match idx {
+            Some(i) => (i as isize + delta).clamp(0, ids.len().saturating_sub(1) as isize) as usize,
+            None => 0,
+        };
+        if let Some(id) = ids.get(next).copied() {
+            self.set_focus(ctx, id);
+        }
+    }
+
+    /// The panes LB/RB cycle between, in order — Right is deliberately
+    /// excluded (reached only via explicit triggers: X, R3, Permissions…).
+    fn pane_cycle(&self) -> Vec<Pane> {
+        let mut cycle = Vec::new();
+        if self.sidebar_open {
+            cycle.push(Pane::Sidebar);
+        }
+        cycle.push(Pane::Active);
+        // While a context/permissions menu is open, LB/RB should stay
+        // scoped to what's actually relevant right now (Sidebar/Active/
+        // Right) rather than being able to wander up to the toolbar —
+        // user request, "restrict l/r analogue too, so it can't reach the
+        // top bar". Right only joins the cycle in this state; it's
+        // otherwise reached solely via its explicit triggers (X, R3, the
+        // Permissions button, …).
+        if self.context_menu_open || self.perm_editor.is_some() {
+            cycle.push(Pane::Right);
+        } else {
+            cycle.push(Pane::Toolbar);
+        }
+        cycle
+    }
+
+    /// LB/RB — move to the next/previous pane in [`Self::pane_cycle`] and
+    /// restore its remembered cursor position (see [`Self::focus_pane`]).
+    fn switch_pane(&mut self, ctx: &egui::Context, delta: isize) {
+        let cycle = self.pane_cycle();
+        if cycle.is_empty() {
+            return;
+        }
+        let current = self.focused_pane(ctx);
+        let idx = current.and_then(|p| cycle.iter().position(|c| *c == p));
+        let next = match idx {
+            Some(i) => (i as isize + delta).rem_euclid(cycle.len() as isize) as usize,
+            None => 0,
+        };
+        self.focus_pane(ctx, cycle[next]);
+    }
+
+    /// Gives keyboard focus to a pane, preferring its last-remembered
+    /// widget (see the `*_last_focus` fields) so the cursor lands "where
+    /// you left off" instead of always snapping to the first row — this is
+    /// what fixes focus disappearing when switching to the sidebar/mounts.
+    fn focus_pane(&mut self, ctx: &egui::Context, pane: Pane) {
+        let remembered = match pane {
+            Pane::Sidebar => self.sidebar_last_focus,
+            Pane::Active => self.active_last_focus,
+            Pane::Toolbar => self.toolbar_last_focus,
+            Pane::Right => self.right_last_focus,
+        };
+        // Right has no tracked id list (see `pane_ids`), so there's
+        // nothing to validate `remembered` against — just trust it
+        // directly; it's kept up to date every frame regardless of
+        // `pane_ids`, via the same bookkeeping the other panes use.
+        let target = if pane == Pane::Right {
+            remembered
+        } else {
+            let ids = self.pane_ids(pane);
+            remembered
+                .filter(|id| ids.contains(id))
+                .or_else(|| ids.first().copied())
+        };
+        if let Some(id) = target {
+            self.set_focus(ctx, id);
         }
     }
 
@@ -322,9 +577,51 @@ impl BrowDeckApp {
         }
     }
 
+    /// Gamepad X — selects whichever file-list entry currently has focus,
+    /// *without* navigating into it even if it's a folder (unlike A/
+    /// Activate, which always enters a focused folder). This is how a
+    /// folder gets selected for Copy/Cut/Delete/Permissions via gamepad
+    /// alone — mirrors what a mouse right-click already does for any
+    /// entry (see the `secondary_clicked()` handling in `show_dir`).
+    fn select_focused_entry(&mut self, ctx: &egui::Context) {
+        let Some(id) = ctx.memory(|m| m.focused()) else {
+            return;
+        };
+        let Some(path) = self
+            .entry_ids
+            .iter()
+            .find(|(eid, _)| *eid == id)
+            .map(|(_, p)| p.clone())
+        else {
+            return;
+        };
+        self.set_selected(Some(path));
+    }
+
     /// Whether a real gamepad is connected — gates the bottom legend bar.
     fn has_connected_pad(&self) -> bool {
         self.gamepad.as_ref().is_some_and(|g| g.has_connected_pad())
+    }
+
+    /// Whether `pane` should render un-dimmed — always true without a
+    /// connected gamepad (mouse clicks don't grant egui focus, so "dim
+    /// whatever isn't focused" would otherwise leave the whole app dimmed
+    /// for mouse-only use).
+    fn pane_undimmed(&self, focused_pane: Option<Pane>, pane: Pane) -> bool {
+        !self.has_connected_pad() || focused_pane == Some(pane)
+    }
+
+    /// Applies this frame's pending right-stick scroll (if any) to
+    /// whichever `ScrollArea` is currently drawing content for `pane`, if
+    /// that's the focused one. Must be called from *inside* the target
+    /// `ScrollArea`'s own closure — that's what `Ui::scroll_with_delta`
+    /// scrolls.
+    fn apply_pending_scroll(&self, ui: &egui::Ui, pane: Pane) {
+        if self.focused_pane(ui.ctx()) == Some(pane)
+            && let Some(delta) = self.pending_scroll
+        {
+            ui.scroll_with_delta(egui::vec2(0.0, delta));
+        }
     }
 
     /// Colored circular badge for a face button (A/B/X/Y), matching
@@ -369,41 +666,47 @@ impl BrowDeckApp {
     /// connected — mirrors the "always-visible button hints" bar in
     /// DeckCrate (this project's inspiration) rather than scattering hints
     /// next to individual buttons.
-    fn show_gamepad_legend(&self, ui: &mut egui::Ui) {
+    fn show_status_bar(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            // Deliberately not `self.icon(...)` — this bar has a fixed
-            // height (`.exact_size` on its Panel) and must stay that way
-            // regardless of the icon-scale setting, unlike the toolbar
-            // (which has no fixed size and simply grows/shrinks with it).
-            ui.label(ICON_GAMEPAD.rich_text().size(BASE_ICON_SIZE));
-            ui.label("Move");
-            ui.separator();
-            Self::face_badge(ui, "A", egui::Color32::from_rgb(0x5A, 0xB4, 0x4B));
-            ui.label("Open");
-            Self::face_badge(ui, "B", egui::Color32::from_rgb(0xD1, 0x4A, 0x4A));
-            ui.label("Back/Up dir");
-            Self::face_badge(ui, "X", egui::Color32::from_rgb(0x3D, 0x7E, 0xD6));
-            ui.label("Actions");
-            Self::face_badge(ui, "Y", egui::Color32::from_rgb(0xD9, 0xB4, 0x33));
-            ui.label("Search");
-            ui.separator();
-            Self::key_badge(ui, "LB/RB");
-            ui.label("Pane");
-            Self::key_badge(ui, "LT/RT");
-            ui.label("Zoom");
-            Self::key_badge(ui, "L3");
-            ui.label("Multi-select");
-            Self::key_badge(ui, "R3/Start");
-            ui.label("Open");
-            Self::key_badge(ui, "Select");
-            ui.label("Preview width");
-            if self.multi_select {
+            if self.has_connected_pad() {
+                // Deliberately not `self.icon(...)` — this bar has a fixed
+                // height (`.exact_size` on its Panel) and must stay that
+                // way regardless of the icon-scale setting, unlike the
+                // toolbar (which has no fixed size and simply grows/
+                // shrinks with it).
+                ui.label(ICON_GAMEPAD.rich_text().size(BASE_ICON_SIZE));
+                ui.label("Move");
                 ui.separator();
-                ui.colored_label(
-                    egui::Color32::from_rgb(100, 150, 255),
-                    format!("Multi-select: {} selected", self.multi_selected.len()),
-                );
+                Self::face_badge(ui, "A", egui::Color32::from_rgb(0x5A, 0xB4, 0x4B));
+                ui.label("Open");
+                Self::face_badge(ui, "B", egui::Color32::from_rgb(0xD1, 0x4A, 0x4A));
+                ui.label("Back/Up dir");
+                Self::face_badge(ui, "X", egui::Color32::from_rgb(0x3D, 0x7E, 0xD6));
+                ui.label("Actions");
+                Self::face_badge(ui, "Y", egui::Color32::from_rgb(0xD9, 0xB4, 0x33));
+                ui.label("Refresh (hold: Search)");
+                ui.separator();
+                Self::key_badge(ui, "LB/RB");
+                ui.label("Pane");
+                Self::key_badge(ui, "LT/RT");
+                ui.label("Zoom");
+                Self::key_badge(ui, "L3");
+                ui.label("Multi-select");
+                Self::key_badge(ui, "R3/Start");
+                ui.label("Open");
+                Self::key_badge(ui, "Select");
+                ui.label("Preview width");
+                if self.multi_select {
+                    ui.separator();
+                    ui.colored_label(
+                        egui::Color32::from_rgb(100, 150, 255),
+                        format!("Multi-select: {} selected", self.multi_selected.len()),
+                    );
+                }
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.weak(format!("v{}", env!("CARGO_PKG_VERSION")));
+            });
         });
     }
 
@@ -441,7 +744,8 @@ impl BrowDeckApp {
     }
 
     /// Classifies the currently-focused widget into a pane, using last
-    /// frame's pane rects — used only to paint a focus-highlight border.
+    /// frame's pane rects — used to paint a focus-highlight border and to
+    /// confine d-pad/stick movement and LB/RB pane-switching to it.
     fn focused_pane(&self, ctx: &egui::Context) -> Option<Pane> {
         let id = ctx.memory(|m| m.focused())?;
         let center = ctx.read_response(id)?.rect.center();
@@ -449,19 +753,27 @@ impl BrowDeckApp {
             Some(Pane::Sidebar)
         } else if self.right_rect.is_some_and(|r| r.contains(center)) {
             Some(Pane::Right)
+        } else if self.toolbar_rect.is_some_and(|r| r.contains(center)) {
+            Some(Pane::Toolbar)
         } else if self.central_rect.is_some_and(|r| r.contains(center)) {
-            Some(Pane::FileList)
+            Some(Pane::Active)
         } else {
             None
         }
     }
 
+    /// Marks the active pane by dimming every *other* pane instead of
+    /// drawing a border on the active one — a border read as distracting
+    /// (user feedback, 2026-09-08); dimming the rest is calmer and still
+    /// unambiguous. `active` should already account for whether a gamepad
+    /// is connected at all (see call sites) — mouse-only use never sets
+    /// egui focus just by clicking, so unconditionally dimming "whatever
+    /// isn't focused" would leave the whole app permanently dimmed for a
+    /// mouse-only user.
     fn paint_pane_highlight(ui: &egui::Ui, active: bool) {
-        if active {
-            let mut stroke = ui.visuals().selection.stroke;
-            stroke.width = stroke.width.max(2.0);
+        if !active {
             ui.painter()
-                .rect_stroke(ui.max_rect(), 0.0, stroke, egui::StrokeKind::Inside);
+                .rect_filled(ui.max_rect(), 0.0, egui::Color32::from_black_alpha(100));
         }
     }
 
@@ -482,8 +794,22 @@ impl BrowDeckApp {
 
 impl eframe::App for BrowDeckApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let previously_unfinished: Vec<bool> = self.jobs.iter().map(|j| !j.finished).collect();
         for job in &mut self.jobs {
             job.poll();
+        }
+        // A copy/move/extract job writes into `current_dir` but, unlike
+        // delete/restore/empty-trash, has no synchronous call site to
+        // follow up with a `refresh()` — the write happens on a
+        // background thread. Catch the exact frame a job transitions to
+        // finished (not every frame it lingers) and refresh then instead.
+        let any_just_finished = self
+            .jobs
+            .iter()
+            .zip(previously_unfinished)
+            .any(|(job, was_unfinished)| was_unfinished && job.finished);
+        if any_just_finished && matches!(self.view, View::Dir) {
+            self.refresh();
         }
         let has_active_job = self.jobs.iter().any(|j| !j.finished);
         self.jobs
@@ -493,6 +819,21 @@ impl eframe::App for BrowDeckApp {
         }
 
         let focused_pane = self.focused_pane(ui.ctx());
+        // Reset every frame — only set again below if the right stick is
+        // actually tilted past the deadzone this frame.
+        self.pending_scroll = None;
+        // Remember which widget was focused in each pane, so switching back
+        // to it (LB/RB) restores the cursor there instead of landing on
+        // nothing (or always the first row).
+        if let Some(id) = ui.ctx().memory(|m| m.focused()) {
+            match focused_pane {
+                Some(Pane::Sidebar) => self.sidebar_last_focus = Some(id),
+                Some(Pane::Active) => self.active_last_focus = Some(id),
+                Some(Pane::Toolbar) => self.toolbar_last_focus = Some(id),
+                Some(Pane::Right) => self.right_last_focus = Some(id),
+                None => {}
+            }
+        }
 
         if let Some(gamepad) = &mut self.gamepad {
             let actions = gamepad.poll();
@@ -511,7 +852,7 @@ impl eframe::App for BrowDeckApp {
                         // back from a mouse-driven selection that never set
                         // it in the first place.
                         self.ensure_focus_anchor(ui.ctx());
-                        ui.ctx().memory_mut(|m| m.move_focus(dir));
+                        self.move_focus_confined(ui.ctx(), dir);
                     }
                     gamepad::Action::Activate => {
                         if self.multi_select && matches!(self.view, View::Dir) {
@@ -538,24 +879,30 @@ impl eframe::App for BrowDeckApp {
                     }
                     gamepad::Action::Back => self.back_or_up(),
                     gamepad::Action::ContextMenu => {
+                        if !self.multi_select && matches!(self.view, View::Dir) {
+                            self.select_focused_entry(ui.ctx());
+                        }
                         if self.actions_available() {
                             self.context_menu_open = true;
                             self.focus_first_action = true;
                         }
                     }
-                    gamepad::Action::SwapPaneLeft => {
-                        self.ensure_focus_anchor(ui.ctx());
-                        ui.ctx()
-                            .memory_mut(|m| m.move_focus(egui::FocusDirection::Left));
-                    }
-                    gamepad::Action::SwapPaneRight => {
-                        self.ensure_focus_anchor(ui.ctx());
-                        ui.ctx()
-                            .memory_mut(|m| m.move_focus(egui::FocusDirection::Right));
-                    }
+                    gamepad::Action::SwapPaneLeft => self.switch_pane(ui.ctx(), -1),
+                    gamepad::Action::SwapPaneRight => self.switch_pane(ui.ctx(), 1),
                     gamepad::Action::TogglePreviewWidth => {
                         self.preview_wide = !self.preview_wide;
                     }
+                    gamepad::Action::Refresh => match focused_pane {
+                        Some(Pane::Sidebar) => {
+                            self.places = places::list_places();
+                            self.mounts = mounts::list_mounts();
+                        }
+                        Some(Pane::Active) => match self.view {
+                            View::Dir => self.refresh(),
+                            View::Trash => self.trash_entries = deleted::list_trash(),
+                        },
+                        _ => {}
+                    },
                     gamepad::Action::Search => {
                         self.search_open = true;
                         self.focus_search = true;
@@ -564,59 +911,87 @@ impl eframe::App for BrowDeckApp {
                     gamepad::Action::ScaleUp => self.scale_up(),
                     gamepad::Action::Open => self.open_selected(),
                     gamepad::Action::Scroll(amount) => {
-                        ui.ctx().input_mut(|i| {
-                            i.events.push(egui::Event::MouseWheel {
-                                unit: egui::MouseWheelUnit::Point,
-                                delta: egui::vec2(0.0, amount * SCROLL_SPEED),
-                                phase: egui::TouchPhase::Move,
-                                modifiers: egui::Modifiers::NONE,
-                            });
-                        });
+                        // Stashed here and applied via `Ui::scroll_with_delta`
+                        // from inside whichever pane's `ScrollArea` is
+                        // currently focused — a synthetic `MouseWheel`
+                        // event alone doesn't work (see NOTES.md, "gamepad
+                        // scrolling needs `scroll_with_delta`, not a fake
+                        // pointer hover"): egui only computes pointer hover
+                        // once per pass, at its very start, so an event
+                        // pushed mid-frame here is too late to affect it.
+                        self.pending_scroll = Some(amount * SCROLL_SPEED);
                     }
                 }
             }
         }
 
-        egui::Panel::top("toolbar").show(ui, |ui| {
+        let toolbar_resp = egui::Panel::top("toolbar").show(ui, |ui| {
+            Self::paint_pane_highlight(ui, self.pane_undimmed(focused_pane, Pane::Toolbar));
+            let mut toolbar_ids = Vec::new();
             ui.horizontal(|ui| {
                 let hamburger = ui.button(self.icon(ICON_MENU));
                 if hamburger.clicked() {
                     self.sidebar_open = !self.sidebar_open;
                 }
                 self.top_focus_id = hamburger.id;
-                if ui.button((self.icon(ICON_ARROW_UPWARD), "Up")).clicked() {
+                toolbar_ids.push(hamburger.id);
+                let up = ui.button((self.icon(ICON_ARROW_UPWARD), "Up"));
+                if up.clicked() {
                     self.go_back();
                 }
+                toolbar_ids.push(up.id);
                 ui.separator();
-                if ui
+                let zoom_out = ui
                     .add_enabled(
                         *ICON_SCALE_RANGE.start() < self.icon_scale,
                         egui::Button::new(self.icon(ICON_ZOOM_OUT)),
                     )
-                    .on_hover_text("Smaller icons")
-                    .clicked()
-                {
+                    .on_hover_text("Smaller icons");
+                if zoom_out.clicked() {
                     self.scale_down();
                 }
-                if ui
+                toolbar_ids.push(zoom_out.id);
+                let zoom_in = ui
                     .add_enabled(
                         self.icon_scale < *ICON_SCALE_RANGE.end(),
                         egui::Button::new(self.icon(ICON_ZOOM_IN)),
                     )
-                    .on_hover_text("Bigger icons")
-                    .clicked()
-                {
+                    .on_hover_text("Bigger icons");
+                if zoom_in.clicked() {
                     self.scale_up();
                 }
+                toolbar_ids.push(zoom_in.id);
                 ui.separator();
-                if ui
+                let preview = ui
                     .selectable_label(self.preview_enabled, (self.icon(ICON_PREVIEW), "Preview"))
-                    .on_hover_text("Auto-preview images/text files on select")
-                    .clicked()
-                {
+                    .on_hover_text("Auto-preview images/text files on select");
+                if preview.clicked() {
                     self.preview_enabled = !self.preview_enabled;
                     self.refresh_preview();
                 }
+                toolbar_ids.push(preview.id);
+                ui.separator();
+                let refresh_mounts = ui
+                    .button(self.icon(ICON_REFRESH))
+                    .on_hover_text("Refresh mounts");
+                if refresh_mounts.clicked() {
+                    self.mounts = mounts::list_mounts();
+                }
+                toolbar_ids.push(refresh_mounts.id);
+                let show_all = ui
+                    .selectable_label(
+                        self.show_all_mounts,
+                        self.icon(if self.show_all_mounts {
+                            ICON_VISIBILITY
+                        } else {
+                            ICON_VISIBILITY_OFF
+                        }),
+                    )
+                    .on_hover_text("Show all mounts, not just common locations");
+                if show_all.clicked() {
+                    self.show_all_mounts = !self.show_all_mounts;
+                }
+                toolbar_ids.push(show_all.id);
                 ui.separator();
                 match self.view {
                     View::Dir => ui.label(self.current_dir.to_string_lossy()),
@@ -630,72 +1005,26 @@ impl eframe::App for BrowDeckApp {
                     );
                 }
             });
+            self.toolbar_ids = toolbar_ids;
         });
+        self.toolbar_rect = Some(toolbar_resp.response.rect);
 
-        if self.has_connected_pad() {
-            egui::Panel::bottom("gamepad_legend")
-                .exact_size(28.0)
-                .show(ui, |ui| self.show_gamepad_legend(ui));
-        }
+        egui::Panel::bottom("status_bar")
+            .exact_size(36.0)
+            .show(ui, |ui| self.show_status_bar(ui));
 
         if self.sidebar_open {
             let resp = egui::Panel::left("sidebar").show(ui, |ui| {
-                Self::paint_pane_highlight(ui, focused_pane == Some(Pane::Sidebar));
-                ui.heading("Places");
-                let mut clicked_place = None;
-                for place in &self.places {
-                    if ui
-                        .selectable_label(false, (self.icon(place.icon), place.label.as_str()))
-                        .clicked()
-                    {
-                        clicked_place = Some(place.path.clone());
-                    }
-                }
-
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.heading("Mounts");
-                    if ui.small_button(self.icon(ICON_REFRESH)).clicked() {
-                        self.mounts = mounts::list_mounts();
-                    }
-                    ui.checkbox(&mut self.show_all_mounts, "Show all");
-                });
-                let visible_mounts: Vec<&mounts::Mount> = self
-                    .mounts
-                    .iter()
-                    .filter(|m| self.show_all_mounts || m.is_common_location())
-                    .collect();
-                if visible_mounts.is_empty() {
-                    ui.weak("(none)");
-                }
-                let mut clicked_mount = None;
-                for mount in visible_mounts {
-                    let mount_label = mount.mount_point.to_string_lossy().into_owned();
-                    let response = ui
-                        .selectable_label(false, (self.icon(mount.icon()), mount_label.as_str()))
-                        .on_hover_text(&mount.device);
-                    if response.clicked() {
-                        clicked_mount = Some(mount.mount_point.clone());
-                    }
-                }
-                if let Some(dir) = clicked_place.or(clicked_mount) {
-                    self.navigate_to(dir);
-                }
-
-                ui.add_space(8.0);
-                if ui
-                    .selectable_label(
-                        matches!(self.view, View::Trash),
-                        (self.icon(ICON_DELETE), "Trash"),
-                    )
-                    .clicked()
-                {
-                    self.open_trash();
-                }
+                Self::paint_pane_highlight(ui, self.pane_undimmed(focused_pane, Pane::Sidebar));
+                egui::ScrollArea::vertical()
+                    .id_salt("sidebar_list")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.show_sidebar_contents(ui));
             });
             self.sidebar_rect = Some(resp.response.rect);
         } else {
             self.sidebar_rect = None;
+            self.sidebar_ids.clear();
         }
 
         let preview_visible = self.preview_enabled
@@ -704,40 +1033,65 @@ impl eframe::App for BrowDeckApp {
                 .as_deref()
                 .and_then(preview::classify)
                 .is_some();
-        let show_actions =
-            self.context_menu_open || self.perm_editor.is_some() || !self.jobs.is_empty();
+        let show_actions = self.context_menu_open;
+        let show_permissions = self.perm_editor.is_some();
+        let show_progress = !self.jobs.is_empty();
         // Only reserve the right pane's screen space when it actually has
         // something to show — otherwise it's just an empty strip.
-        if preview_visible || show_actions {
+        if preview_visible || show_actions || show_permissions || show_progress {
             let mut right_panel = egui::Panel::right("right_pane");
             if self.preview_wide {
                 right_panel = right_panel.exact_size(ui.ctx().content_rect().width() * 0.4);
             }
             let right_resp = right_panel.show(ui, |ui| {
-                Self::paint_pane_highlight(ui, focused_pane == Some(Pane::Right));
-                if preview_visible {
-                    self.show_preview_panel(ui);
+                Self::paint_pane_highlight(ui, self.pane_undimmed(focused_pane, Pane::Right));
+                // Each zone below Preview sizes itself to its own content
+                // (compact, no forced percentage — a short Actions row
+                // shouldn't leave a blank gap under it) and anchors to the
+                // *bottom* of the pane, working inward: Progress first (so
+                // it's always the very bottom-most), then Permissions,
+                // then Actions — each of those claims the next slice up
+                // from whatever's left. Preview then fills all the
+                // remaining space above them, however much or little that
+                // is (even the whole pane, if none of the others are
+                // showing). See NOTES.md "right pane zones are compact
+                // and bottom-anchored, not proportional" for why the
+                // earlier percentage-based version was replaced.
+                if show_progress {
+                    egui::Panel::bottom("right_progress_zone").show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("right_progress_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                self.apply_pending_scroll(ui, Pane::Right);
+                                self.show_progress_zone(ui);
+                            });
+                    });
+                }
+                if show_permissions {
+                    egui::Panel::bottom("right_permissions_zone").show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("right_permissions_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                self.apply_pending_scroll(ui, Pane::Right);
+                                self.show_permission_editor(ui);
+                            });
+                    });
                 }
                 if show_actions {
-                    if preview_visible {
-                        ui.separator();
-                    }
-                    egui::ScrollArea::vertical()
-                        .id_salt("right_pane_lower")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            if self.context_menu_open {
+                    egui::Panel::bottom("right_actions_zone").show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("right_actions_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                self.apply_pending_scroll(ui, Pane::Right);
                                 self.show_actions_zone(ui);
-                                ui.add_space(8.0);
-                            }
-                            if self.perm_editor.is_some() {
-                                self.show_permission_editor(ui);
-                                ui.add_space(8.0);
-                            }
-                            if !self.jobs.is_empty() {
-                                self.show_progress_zone(ui);
-                            }
-                        });
+                            });
+                    });
+                }
+                if preview_visible {
+                    self.show_preview_panel(ui);
                 }
             });
             self.right_rect = Some(right_resp.response.rect);
@@ -746,7 +1100,7 @@ impl eframe::App for BrowDeckApp {
         }
 
         let central_resp = egui::CentralPanel::default().show(ui, |ui| {
-            Self::paint_pane_highlight(ui, focused_pane == Some(Pane::FileList));
+            Self::paint_pane_highlight(ui, self.pane_undimmed(focused_pane, Pane::Active));
             match self.view {
                 View::Dir => self.show_dir(ui),
                 View::Trash => self.show_trash(ui),
@@ -757,6 +1111,64 @@ impl eframe::App for BrowDeckApp {
 }
 
 impl BrowDeckApp {
+    fn show_sidebar_contents(&mut self, ui: &mut egui::Ui) {
+        self.apply_pending_scroll(ui, Pane::Sidebar);
+        let mut sidebar_ids = Vec::new();
+        ui.heading("Places");
+        let mut clicked_place = None;
+        for place in &self.places {
+            let r = ui.selectable_label(false, (self.icon(place.icon), place.label.as_str()));
+            if self.scroll_to_focus == Some(r.id) {
+                r.scroll_to_me(Some(egui::Align::Center));
+                self.scroll_to_focus = None;
+            }
+            sidebar_ids.push(r.id);
+            if r.clicked() {
+                clicked_place = Some(place.path.clone());
+            }
+        }
+
+        ui.add_space(8.0);
+        ui.heading("Mounts");
+        let visible_mounts: Vec<&mounts::Mount> = self
+            .mounts
+            .iter()
+            .filter(|m| self.show_all_mounts || m.is_common_location())
+            .collect();
+        if visible_mounts.is_empty() {
+            ui.weak("(none)");
+        }
+        let mut clicked_mount = None;
+        for mount in visible_mounts {
+            let mount_label = mount.mount_point.to_string_lossy().into_owned();
+            let response = ui
+                .selectable_label(false, (self.icon(mount.icon()), mount_label.as_str()))
+                .on_hover_text(&mount.device);
+            if self.scroll_to_focus == Some(response.id) {
+                response.scroll_to_me(Some(egui::Align::Center));
+                self.scroll_to_focus = None;
+            }
+            sidebar_ids.push(response.id);
+            if response.clicked() {
+                clicked_mount = Some(mount.mount_point.clone());
+            }
+        }
+        if let Some(dir) = clicked_place.or(clicked_mount) {
+            self.navigate_to(dir);
+        }
+
+        ui.add_space(8.0);
+        let trash_row = ui.selectable_label(
+            matches!(self.view, View::Trash),
+            (self.icon(ICON_DELETE), "Trash"),
+        );
+        sidebar_ids.push(trash_row.id);
+        if trash_row.clicked() {
+            self.open_trash();
+        }
+        self.sidebar_ids = sidebar_ids;
+    }
+
     fn show_dir(&mut self, ui: &mut egui::Ui) {
         if self.search_open {
             ui.horizontal(|ui| {
@@ -770,9 +1182,24 @@ impl BrowDeckApp {
                     search_resp.request_focus();
                     self.focus_search = false;
                 }
+                if search_resp.changed() {
+                    self.recursive_dirty = true;
+                    self.recursive_spinner_shown = false;
+                }
+                let recursive_toggle = ui
+                    .selectable_label(self.recursive_search, self.icon(ICON_ACCOUNT_TREE))
+                    .on_hover_text("Also search subfolders");
+                if recursive_toggle.clicked() {
+                    self.recursive_search = !self.recursive_search;
+                    self.recursive_dirty = true;
+                    self.recursive_spinner_shown = false;
+                }
                 if ui.button(self.icon(ICON_CLOSE)).clicked() {
                     self.search_open = false;
                     self.search_query.clear();
+                    self.recursive_results.clear();
+                    self.recursive_dirty = false;
+                    self.recursive_spinner_shown = false;
                 }
             });
         } else if ui.button(self.icon(ICON_SEARCH)).clicked() {
@@ -780,18 +1207,54 @@ impl BrowDeckApp {
             self.focus_search = true;
         }
         ui.separator();
+
+        let recursive_active =
+            self.recursive_search && self.search_open && !self.search_query.is_empty();
+        if recursive_active && self.recursive_dirty {
+            // Deferred one frame on purpose: this lets the spinner
+            // actually get painted before the (blocking, synchronous)
+            // walk runs — see NOTES.md "recursive search runs
+            // synchronously, not threaded".
+            if self.recursive_spinner_shown {
+                let query = self.search_query.to_lowercase();
+                self.recursive_results = self.recursive_search(&query);
+                self.recursive_dirty = false;
+                self.recursive_spinner_shown = false;
+            } else {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Searching…");
+                });
+                self.recursive_spinner_shown = true;
+                ui.ctx().request_repaint();
+                return;
+            }
+        }
+
         egui::ScrollArea::vertical()
             .id_salt("dir_list")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                self.apply_pending_scroll(ui, Pane::Active);
                 let query = self.search_query.to_lowercase();
+                let source: &[Entry] = if recursive_active {
+                    &self.recursive_results
+                } else {
+                    &self.entries
+                };
                 let mut new_selection = None;
                 let mut next_dir = None;
                 let mut open_file = None;
                 let mut empty_area_secondary_click = false;
                 let mut entry_ids = Vec::new();
-                for entry in &self.entries {
-                    if !query.is_empty() && !entry.name.to_lowercase().contains(&query) {
+                for entry in source {
+                    // Recursive results are already filtered by the walk
+                    // itself; only the flat (non-recursive) list needs
+                    // filtering here.
+                    if !recursive_active
+                        && !query.is_empty()
+                        && !entry.name.to_lowercase().contains(&query)
+                    {
                         continue;
                     }
                     let icon = if entry.is_dir {
@@ -806,6 +1269,10 @@ impl BrowDeckApp {
                     };
                     let response =
                         ui.selectable_label(is_selected, (self.icon(icon), entry.name.as_str()));
+                    if self.scroll_to_focus == Some(response.id) {
+                        response.scroll_to_me(Some(egui::Align::Center));
+                        self.scroll_to_focus = None;
+                    }
                     entry_ids.push((response.id, entry.path.clone()));
                     if response.clicked() {
                         if self.multi_select {
@@ -863,8 +1330,10 @@ impl BrowDeckApp {
             .id_salt("trash_list")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                self.apply_pending_scroll(ui, Pane::Active);
                 let mut restore_idx = None;
                 let mut empty_area_secondary_click = false;
+                let mut trash_ids = Vec::new();
                 for (i, entry) in self.trash_entries.iter().enumerate() {
                     let label = format!(
                         "{}  (from {})",
@@ -874,6 +1343,11 @@ impl BrowDeckApp {
                     let is_selected = self.selected_trash == Some(i);
                     let response = ui
                         .selectable_label(is_selected, (self.icon(ICON_RESTORE_FROM_TRASH), label));
+                    if self.scroll_to_focus == Some(response.id) {
+                        response.scroll_to_me(Some(egui::Align::Center));
+                        self.scroll_to_focus = None;
+                    }
+                    trash_ids.push(response.id);
                     if response.clicked() {
                         self.selected_trash = Some(i);
                     }
@@ -886,6 +1360,7 @@ impl BrowDeckApp {
                         self.focus_first_action = true;
                     }
                 }
+                self.trash_ids = trash_ids;
                 let remaining = ui.available_size();
                 if remaining.y > 4.0 {
                     let empty_resp = ui.allocate_response(remaining, egui::Sense::click());
@@ -915,11 +1390,16 @@ impl BrowDeckApp {
         };
         match preview::classify(&path) {
             Some(preview::Kind::Image) => {
+                // Fills whatever's left in the pane (the footer, if any,
+                // already claimed its own space below) — `shrink_to_fit`
+                // scales the image to fit that fully, up or down,
+                // preserving aspect ratio, rather than sitting at its
+                // intrinsic size with dead space around it.
                 egui::ScrollArea::vertical()
                     .id_salt("preview_image")
                     .auto_shrink([false, false])
-                    .max_height(ui.available_height() * 0.5)
                     .show(ui, |ui| {
+                        self.apply_pending_scroll(ui, Pane::Right);
                         ui.add(egui::Image::new(preview::file_uri(&path)).shrink_to_fit());
                     });
             }
@@ -931,8 +1411,8 @@ impl BrowDeckApp {
                     egui::ScrollArea::vertical()
                         .id_salt("preview_text")
                         .auto_shrink([false, false])
-                        .max_height(ui.available_height() * 0.5)
                         .show(ui, |ui| {
+                            self.apply_pending_scroll(ui, Pane::Right);
                             ui.monospace(text);
                         });
                 }

@@ -1,5 +1,27 @@
 ## [Unreleased]
 
+## [1.0.0] — 2026-09-08
+
+### Added
+- Multi-select for batch copy/cut/delete
+- `.tar`/`.tar.gz`/`.tgz` extraction
+- Recursive (subfolder) search with a loading indicator
+- Persistent status bar with gamepad legend and app version
+- Select a folder without opening it
+
+### Changed
+- Full gamepad remap — see README for the button reference
+- D-pad/stick navigation confined to the focused pane; LB/RB switches panes
+- Focused row auto-scrolls into view; right-stick scrolling fixed
+- Right pane zones stack compactly from the bottom instead of a fixed split
+- Inactive panes dim instead of a highlight border on the active one
+- Image preview fills the available pane space
+- Refresh and "show all mounts" moved to the toolbar
+
+### Fixed
+- File/trash list wasn't refreshing after copy/paste or extract
+- Misconfigured `XDG_DOWNLOAD_DIR` could point Downloads at Home
+
 ## [0.9.0] — 2026-09-07
 
 ### Added

@@ -7,6 +7,8 @@ const REPEAT_DELAY: Duration = Duration::from_millis(400);
 /// Interval between repeats once auto-repeat has kicked in.
 const REPEAT_INTERVAL: Duration = Duration::from_millis(120);
 const STICK_THRESHOLD: f32 = 0.5;
+/// How long Y must be held before it opens Search instead of Refresh.
+const SEARCH_HOLD: Duration = Duration::from_secs(3);
 
 pub enum Action {
     Move(egui::FocusDirection),
@@ -28,7 +30,10 @@ pub enum Action {
     /// Select — toggle the preview pane's width between 40% of the window
     /// and its normal size.
     TogglePreviewWidth,
-    /// Y — open/focus the in-folder search box (also triggers any
+    /// Y tap — refresh whichever pane is active (Sidebar's places/mounts,
+    /// or the main file/trash list); a no-op elsewhere.
+    Refresh,
+    /// Y held 3s — open/focus the in-folder search box (also triggers any
     /// on-screen keyboard the session provides, via egui's normal IME
     /// request when a text field gains focus).
     Search,
@@ -50,6 +55,8 @@ pub struct GamepadInput {
     /// Left stick is a plain analog equivalent of the d-pad — same
     /// edge-triggered `Move` action, not restricted to any one pane.
     left_stick_direction: Option<egui::FocusDirection>,
+    north_pressed_at: Option<Instant>,
+    north_hold_fired: bool,
 }
 
 impl GamepadInput {
@@ -63,6 +70,8 @@ impl GamepadInput {
                 last_repeat: HashMap::new(),
                 right_stick_y: 0.0,
                 left_stick_direction: None,
+                north_pressed_at: None,
+                north_hold_fired: false,
             }),
             Err(e) => {
                 eprintln!("gamepad input unavailable: {e}");
@@ -82,6 +91,18 @@ impl GamepadInput {
         let mut actions = Vec::new();
         while let Some(event) = self.gilrs.next_event() {
             match event.event {
+                EventType::ButtonPressed(Button::North, _) => {
+                    self.north_pressed_at = Some(Instant::now());
+                    self.north_hold_fired = false;
+                }
+                EventType::ButtonReleased(Button::North, _) => {
+                    if let Some(pressed_at) = self.north_pressed_at.take()
+                        && !self.north_hold_fired
+                        && pressed_at.elapsed() < SEARCH_HOLD
+                    {
+                        actions.push(Action::Refresh);
+                    }
+                }
                 EventType::ButtonPressed(button, _) => {
                     if let Some(dir) = direction_for(button) {
                         actions.push(Action::Move(dir));
@@ -108,6 +129,13 @@ impl GamepadInput {
         self.apply_repeats(&mut actions);
         if self.right_stick_y.abs() > STICK_THRESHOLD {
             actions.push(Action::Scroll(self.right_stick_y));
+        }
+        if let Some(pressed_at) = self.north_pressed_at
+            && !self.north_hold_fired
+            && pressed_at.elapsed() >= SEARCH_HOLD
+        {
+            actions.push(Action::Search);
+            self.north_hold_fired = true;
         }
         actions
     }
@@ -161,7 +189,6 @@ fn action_for(button: Button) -> Option<Action> {
         Button::South => Some(Action::Activate),
         Button::East => Some(Action::Back),
         Button::West => Some(Action::ContextMenu),
-        Button::North => Some(Action::Search),
         Button::Start => Some(Action::Open),
         Button::Select => Some(Action::TogglePreviewWidth),
         Button::LeftTrigger => Some(Action::SwapPaneLeft),
