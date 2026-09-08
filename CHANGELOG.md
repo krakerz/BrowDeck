@@ -1,5 +1,32 @@
 ## [Unreleased]
 
+## [1.1.0] — 2026-09-08
+
+### Added
+- Show/hide hidden files toggle in the toolbar (hidden by default)
+- IProLaunch action badge shows a checkmark and disables itself once a file
+  is already registered in the library
+- `packaging/install.sh` and `uninstall.sh` for the plain-archive release
+- Automated GitHub Actions release build (tar.gz, draft release)
+
+### Changed
+- Right-stick scroll moves the selection directly instead of a free-floating
+  view offset, and is ~1.75x faster
+- Refresh-mounts and "show all mounts" moved next to the Up button
+- Scrollbars are always visible instead of only on mouse hover
+- D-pad/stick navigation inside the Actions/Permissions strip now steps
+  row-aware between badges instead of using geometric search
+- Closing Actions and Permissions together now closes Permissions first
+- More toolbar buttons have hover tooltips
+
+### Fixed
+- Actions/Permissions strip could render blank
+- D-pad/stick navigation could escape the Actions/Permissions strip into
+  the file list behind it
+- Action badges visibly shifted size when gaining/losing focus
+- Right-stick scroll could stop entirely once the focused row scrolled
+  off-screen
+
 ## [1.0.0] — 2026-09-08
 
 ### Added

@@ -1,0 +1,28 @@
+BrowDeck — Installation
+========================
+
+Run the installer:
+
+    ./install.sh
+
+This puts the `browdeck` binary on your $PATH (~/.local/bin), installs the
+desktop entry + icon so BrowDeck shows up in your application menu and in
+Steam's "Add a Non-Steam Game" browser, and drops the example config at
+~/.config/browdeck/config.example.toml (copy/rename it to config.toml
+yourself if you want to override a default — it never touches an existing
+config.toml).
+
+To remove everything install.sh installed:
+
+    ./uninstall.sh
+
+(Your config at ~/.config/browdeck/ is left in place — delete it yourself
+if you want a completely clean slate.)
+
+Prefer to do it by hand instead? See install.sh/uninstall.sh — they're
+plain, short shell scripts, not build tools.
+
+Adding to Steam (Game Mode)
+----------------------------
+Add BrowDeck as a Non-Steam Game pointing at the `browdeck` binary, so
+it's launchable from Game Mode alongside your games.

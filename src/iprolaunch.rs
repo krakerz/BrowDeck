@@ -34,6 +34,40 @@ pub fn add(bin: &Path, target: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Whether `target` is already a registered library profile: runs
+/// `<bin> library search <target>` and checks whether any returned
+/// profile's path is *exactly* `target` — search itself is a
+/// case-insensitive substring match on name-or-path (IProLaunch's own
+/// `--help` text), so a plain "did it return anything" check would false-
+/// positive on a profile that merely shares a path fragment. Blocking
+/// (`Command::output`), so only call this when the selection actually
+/// changes, not every frame — see `BrowDeckApp::iprolaunch_registered`'s
+/// caching.
+pub fn is_registered(bin: &Path, target: &Path) -> bool {
+    let Ok(output) = Command::new(bin)
+        .arg("library")
+        .arg("search")
+        .arg(target)
+        .output()
+    else {
+        return false;
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .filter_map(search_result_path)
+        .any(|found| Path::new(found) == target)
+}
+
+/// Extracts the path field from one `library search`/`library list` output
+/// line — IProLaunch prints each match as `"{name}  [{slug}]  {path}"`
+/// (`println!("{}  [{slug}]  {}", profile.name, profile.target_path)` in
+/// its own `main.rs`); the path is everything after the first `"]  "`.
+fn search_result_path(line: &str) -> Option<&str> {
+    let idx = line.find("]  ")?;
+    Some(line[idx + 3..].trim())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,5 +118,20 @@ mod tests {
         std::fs::write(&config, dir.join("does-not-exist").display().to_string()).unwrap();
 
         assert_eq!(resolve_bin(&config), None);
+    }
+
+    #[test]
+    fn search_result_path_extracts_the_path_field() {
+        assert_eq!(
+            search_result_path(
+                "circlemate#1  [circlemate]  /media/media/Games/Non Steam/.!/CIRCLEMATE/CIRCLEMATE.exe"
+            ),
+            Some("/media/media/Games/Non Steam/.!/CIRCLEMATE/CIRCLEMATE.exe")
+        );
+    }
+
+    #[test]
+    fn search_result_path_is_none_for_the_no_match_line() {
+        assert_eq!(search_result_path("no games match `xyz`."), None);
     }
 }

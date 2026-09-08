@@ -1,21 +1,33 @@
 use crate::{deleted, fileops, fonts, gamepad, iprolaunch, mounts, permissions, places, preview};
 use egui_material_icons::MaterialIcon;
 use egui_material_icons::icons::{
-    ICON_ACCOUNT_TREE, ICON_ARROW_UPWARD, ICON_CLOSE, ICON_CONTENT_COPY, ICON_CONTENT_CUT,
-    ICON_CONTENT_PASTE, ICON_DELETE, ICON_DELETE_SWEEP, ICON_DESCRIPTION, ICON_FOLDER,
-    ICON_GAMEPAD, ICON_LOCK, ICON_MENU, ICON_OPEN_IN_NEW, ICON_PREVIEW, ICON_REFRESH,
-    ICON_RESTORE_FROM_TRASH, ICON_ROCKET_LAUNCH, ICON_SEARCH, ICON_UNARCHIVE, ICON_VISIBILITY,
-    ICON_VISIBILITY_OFF, ICON_ZOOM_IN, ICON_ZOOM_OUT,
+    ICON_ACCOUNT_TREE, ICON_ARROW_UPWARD, ICON_CHECK_CIRCLE, ICON_CLOSE, ICON_CONTENT_COPY,
+    ICON_CONTENT_CUT, ICON_CONTENT_PASTE, ICON_DELETE, ICON_DELETE_SWEEP, ICON_DESCRIPTION,
+    ICON_FOLDER, ICON_GAMEPAD, ICON_LOCK, ICON_MENU, ICON_OPEN_IN_NEW, ICON_PREVIEW,
+    ICON_PRIORITY_HIGH, ICON_REFRESH, ICON_RESTORE_FROM_TRASH, ICON_ROCKET_LAUNCH, ICON_SEARCH,
+    ICON_UNARCHIVE, ICON_VISIBILITY, ICON_VISIBILITY_OFF, ICON_ZOOM_IN, ICON_ZOOM_OUT,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Default `ScrollBarVisibility::VisibleWhenNeeded` only paints the bar on
+/// mouse hover, not just because content overflows — useless without a
+/// cursor during gamepad play. All `ScrollArea`s use this instead.
+const ALWAYS_VISIBLE_SCROLLBAR: egui::containers::scroll_area::ScrollBarVisibility =
+    egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible;
 /// Base size (px) icons render at before `icon_scale` is applied.
 const BASE_ICON_SIZE: f32 = 18.0;
 const ICON_SCALE_STEP: f32 = 0.15;
 const ICON_SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.7..=2.5;
-/// Points scrolled per frame per unit of right-stick tilt.
+/// Points scrolled per frame per unit of right-stick tilt — used for the
+/// Right pane (Preview/Actions), which has no "selection" concept.
 const SCROLL_SPEED: f32 = 12.0;
+/// Throttle for right-stick-driven selection movement in Sidebar/Active —
+/// `Action::Scroll` fires every frame the stick is tilted, unlike the
+/// d-pad's edge-triggered presses.
+const SCROLL_MOVE_INTERVAL: Duration = Duration::from_millis(51);
+/// The right pane's width when Select's preview-width toggle is off.
+const PREVIEW_NORMAL_WIDTH: f32 = 320.0;
 
 struct Entry {
     name: String,
@@ -67,6 +79,11 @@ pub struct BrowDeckApp {
     gamepad: Option<gamepad::GamepadInput>,
     icon_scale: f32,
     show_all_mounts: bool,
+    /// Whether dotfile entries (name starting with `.`) show up in the
+    /// file list — off by default, matching every mainstream file manager.
+    /// Filtered at render time (see the dir-list loop), same approach as
+    /// `show_all_mounts`, so toggling doesn't need a re-`refresh()`.
+    show_hidden_files: bool,
     preview_enabled: bool,
     /// Gamepad Select toggles this — widens the right pane to 40% of the
     /// window instead of its normal (default/resizable) width.
@@ -89,6 +106,10 @@ pub struct BrowDeckApp {
     sidebar_rect: Option<egui::Rect>,
     central_rect: Option<egui::Rect>,
     right_rect: Option<egui::Rect>,
+    /// The Actions/Permissions/Progress strip's rect — a separate bottom
+    /// bar (not part of `right_rect`/Preview), but still classified as
+    /// `Pane::Right` for focus/highlight purposes.
+    actions_strip_rect: Option<egui::Rect>,
     toolbar_rect: Option<egui::Rect>,
     /// Ids of last frame's file-list rows paired with their path — used to
     /// look up which entry is focused when toggling multi-select, and to
@@ -103,6 +124,16 @@ pub struct BrowDeckApp {
     /// Ids of last frame's toolbar buttons, in visual left-to-right order —
     /// confines d-pad/stick movement to the Toolbar pane.
     toolbar_ids: Vec<egui::Id>,
+    /// Last frame's Actions/Permissions strip widgets (badges, checkboxes),
+    /// one inner `Vec` per row (Actions row, then Permissions row, in that
+    /// order — whichever are actually open) in left-to-right order. Lets
+    /// d-pad/stick movement step through them by index instead of relying
+    /// on egui's geometric `move_focus`, which has no concept of the
+    /// strip's boundary and can walk focus into the file list behind it:
+    /// Left/Right step within the current row, Up/Down switch rows while
+    /// keeping roughly the same column (see `move_focus_confined`'s
+    /// guarded branch).
+    right_focus_rows: Vec<Vec<egui::Id>>,
     /// The last focused widget id seen in each pane, remembered so
     /// switching panes (LB/RB) restores the cursor to "where you left off"
     /// instead of landing nowhere.
@@ -115,12 +146,19 @@ pub struct BrowDeckApp {
     /// (egui doesn't do this on its own) — consumed and cleared by
     /// whichever list draws a row matching this id.
     scroll_to_focus: Option<egui::Id>,
-    /// The right stick's per-frame scroll delta (points), reset to `None`
-    /// every frame and applied by whichever pane's `ScrollArea` currently
-    /// has focus via `Ui::scroll_with_delta` — see NOTES.md "gamepad
-    /// scrolling needs `scroll_with_delta`, not a fake pointer hover" for
-    /// why a synthetic `MouseWheel` event alone doesn't work.
+    /// The right stick's per-frame scroll delta (points) for the Right
+    /// pane only (Preview/Actions — no "selection" concept there), reset
+    /// to `None` every frame and applied via `Ui::scroll_with_delta` — see
+    /// NOTES.md "gamepad scrolling needs `scroll_with_delta`, not a fake
+    /// pointer hover" for why a synthetic `MouseWheel` event alone doesn't
+    /// work. Sidebar/Active use `scroll_move_last` instead — see NOTES.md
+    /// "right-stick scroll now moves the selection, not a free-floating
+    /// view offset".
     pending_scroll: Option<f32>,
+    /// Last time right-stick tilt moved the selection by a row in the
+    /// Sidebar/Active panes — throttles `Action::Scroll` (which fires
+    /// every frame the stick is tilted) to `SCROLL_MOVE_INTERVAL`.
+    scroll_move_last: Option<std::time::Instant>,
     /// Whether the in-folder search also walks subfolders, not just the
     /// current directory.
     recursive_search: bool,
@@ -141,8 +179,24 @@ pub struct BrowDeckApp {
     /// The IProLaunch CLI binary, if `~/.config/iprolaunch/bin-path` exists
     /// — detected once at startup, gates the "Add to IProLaunch" action.
     iprolaunch_bin: Option<PathBuf>,
+    /// Cached result of the last `iprolaunch::is_registered` check, keyed
+    /// by path — `library search` shells out to the CLI, so this is only
+    /// recomputed when the selection changes (see `iprolaunch_registered`),
+    /// not every frame the Actions badge is drawn. Set directly (bypassing
+    /// a re-check) right after a successful `add`.
+    iprolaunch_status: Option<(PathBuf, bool)>,
     multi_select: bool,
     multi_selected: std::collections::HashSet<PathBuf>,
+    /// The last pane `focused_pane()` was able to classify — "sticky"
+    /// across frames where it returns `None`. `focused_pane()` checks
+    /// whether the *focused widget's* on-screen rect falls inside a pane's
+    /// bounds, but scrolling moves that rect outside those bounds (a row
+    /// scrolled off-screen still has a real rect there), which made
+    /// `apply_pending_scroll` stop applying scroll input once the focused
+    /// row scrolled out of view. Updated only when a live classification
+    /// succeeds; every "what pane are we in" decision reads this instead
+    /// of calling `focused_pane()` directly.
+    current_pane: Option<Pane>,
 }
 
 /// How long a finished copy/move job stays visible before auto-closing.
@@ -171,6 +225,7 @@ impl BrowDeckApp {
             gamepad: gamepad::GamepadInput::new(),
             icon_scale: 1.0,
             show_all_mounts: false,
+            show_hidden_files: false,
             preview_enabled: false,
             preview_wide: false,
             preview_text: None,
@@ -184,24 +239,29 @@ impl BrowDeckApp {
             sidebar_rect: None,
             central_rect: None,
             right_rect: None,
+            actions_strip_rect: None,
             toolbar_rect: None,
             entry_ids: Vec::new(),
             trash_ids: Vec::new(),
             sidebar_ids: Vec::new(),
             toolbar_ids: Vec::new(),
+            right_focus_rows: Vec::new(),
             sidebar_last_focus: None,
             active_last_focus: None,
             toolbar_last_focus: None,
             right_last_focus: None,
             scroll_to_focus: None,
             pending_scroll: None,
+            scroll_move_last: None,
             recursive_search: false,
             recursive_results: Vec::new(),
             recursive_dirty: false,
             recursive_spinner_shown: false,
             iprolaunch_bin: iprolaunch::detect_bin(),
+            iprolaunch_status: None,
             multi_select: false,
             multi_selected: std::collections::HashSet::new(),
+            current_pane: None,
         };
         app.refresh();
         app
@@ -364,10 +424,19 @@ impl BrowDeckApp {
         if self.multi_select {
             self.multi_select = false;
             self.multi_selected.clear();
+        } else if self.perm_editor.is_some() {
+            // Permissions opens *from* Actions, never the other way
+            // around, so it's always the more-recently-opened of the two
+            // — B closes it first, leaving Actions. Re-priming
+            // `focus_first_action` below (when Actions stays open) avoids
+            // leaving focus on a now-gone widget, which otherwise read as
+            // the remaining strip going dim/inactive.
+            self.perm_editor = None;
+            if self.context_menu_open {
+                self.focus_first_action = true;
+            }
         } else if self.context_menu_open {
             self.context_menu_open = false;
-        } else if self.perm_editor.is_some() {
-            self.perm_editor = None;
         } else if matches!(self.view, View::Trash) {
             self.view = View::Dir;
             self.set_selected(None);
@@ -441,6 +510,36 @@ impl BrowDeckApp {
         }
     }
 
+    /// Whether focus is currently on a widget inside `actions_strip_rect`.
+    fn focus_inside_strip(&self, ctx: &egui::Context) -> bool {
+        ctx.memory(|m| m.focused())
+            .and_then(|id| ctx.read_response(id))
+            .is_some_and(|r| {
+                self.actions_strip_rect
+                    .is_some_and(|strip| strip.contains(r.rect.center()))
+            })
+    }
+
+    /// Called unconditionally at the top of every frame to catch focus
+    /// starting outside the strip while Actions and/or Permissions is
+    /// open — e.g. the frame the strip first opens, before
+    /// `focus_first_action`'s `request_focus` has taken effect, or if
+    /// `ensure_focus_anchor` re-seeded focus into the file list because
+    /// nothing was focused that frame. Once focus is inside,
+    /// `move_focus_confined`'s guarded branch keeps it there by
+    /// index-stepping through `right_focus_rows`, which can't ever
+    /// produce an out-of-strip id — nothing left for this to correct in
+    /// the steady state.
+    fn enforce_strip_focus_guard(&mut self, ctx: &egui::Context) {
+        let guard_active = self.context_menu_open || self.perm_editor.is_some();
+        if guard_active
+            && !self.focus_inside_strip(ctx)
+            && let Some(id) = self.right_last_focus
+        {
+            self.set_focus(ctx, id);
+        }
+    }
+
     /// Moves focus by one step within whichever pane currently has it,
     /// never letting a direction press leave that pane (that's LB/RB's
     /// job now, see [`Self::switch_pane`]). Sidebar/Active are vertical
@@ -451,7 +550,81 @@ impl BrowDeckApp {
     /// search — its contents are small/self-contained enough in practice
     /// that this hasn't been observed to leak into neighboring panes.
     fn move_focus_confined(&mut self, ctx: &egui::Context, dir: egui::FocusDirection) {
-        let Some(pane) = self.focused_pane(ctx) else {
+        // While Actions and/or Permissions is open, step through
+        // `right_focus_rows` by index instead of egui's geometric
+        // `move_focus` — geometric search has no concept of the strip's
+        // boundary and can walk focus off the end of it (e.g. pressing
+        // Left from the leftmost badge), and `move_focus` only *queues* a
+        // direction resolved later in `end_pass()`, so there's nothing to
+        // synchronously validate or revert if it does. Index-stepping
+        // through a known list can't ever produce an out-of-strip id.
+        // Left/Right step within the current row; Up/Down switch rows
+        // (Actions <-> Permissions) while keeping roughly the same column.
+        let guard_active = self.context_menu_open || self.perm_editor.is_some();
+        if guard_active {
+            let inside = self.focus_inside_strip(ctx);
+            if inside && !self.right_focus_rows.is_empty() {
+                let current = ctx.memory(|m| m.focused());
+                let pos = current.and_then(|id| {
+                    self.right_focus_rows
+                        .iter()
+                        .enumerate()
+                        .find_map(|(r, row)| row.iter().position(|i| *i == id).map(|c| (r, c)))
+                });
+                let next_id = match dir {
+                    egui::FocusDirection::Left | egui::FocusDirection::Right => {
+                        let delta: isize = if dir == egui::FocusDirection::Right {
+                            1
+                        } else {
+                            -1
+                        };
+                        match pos {
+                            Some((r, c)) => {
+                                let row = &self.right_focus_rows[r];
+                                let next_c = (c as isize + delta)
+                                    .clamp(0, row.len().saturating_sub(1) as isize)
+                                    as usize;
+                                row.get(next_c).copied()
+                            }
+                            None => self
+                                .right_focus_rows
+                                .first()
+                                .and_then(|row| row.first())
+                                .copied(),
+                        }
+                    }
+                    egui::FocusDirection::Up | egui::FocusDirection::Down => {
+                        let delta: isize = if dir == egui::FocusDirection::Down {
+                            1
+                        } else {
+                            -1
+                        };
+                        match pos {
+                            Some((r, c)) => {
+                                let next_r = (r as isize + delta).clamp(
+                                    0,
+                                    self.right_focus_rows.len().saturating_sub(1) as isize,
+                                ) as usize;
+                                let target_row = &self.right_focus_rows[next_r];
+                                let next_c = c.min(target_row.len().saturating_sub(1));
+                                target_row.get(next_c).copied()
+                            }
+                            None => self
+                                .right_focus_rows
+                                .first()
+                                .and_then(|row| row.first())
+                                .copied(),
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(id) = next_id {
+                    self.set_focus(ctx, id);
+                }
+            }
+            return;
+        }
+        let Some(pane) = self.current_pane else {
             // No pane classified yet (e.g. focus landed somewhere odd) —
             // fall back to egui's own geometric search rather than doing
             // nothing.
@@ -459,6 +632,9 @@ impl BrowDeckApp {
             return;
         };
         if pane == Pane::Right {
+            // Not guarded here (Progress-only, or the Preview pane) — keep
+            // using egui's own geometric search; see the doc comment on
+            // `pane_ids` for why Right doesn't get a flat confined order.
             ctx.memory_mut(|m| m.move_focus(dir));
             return;
         }
@@ -493,29 +669,25 @@ impl BrowDeckApp {
             cycle.push(Pane::Sidebar);
         }
         cycle.push(Pane::Active);
-        // While a context/permissions menu is open, LB/RB should stay
-        // scoped to what's actually relevant right now (Sidebar/Active/
-        // Right) rather than being able to wander up to the toolbar —
-        // user request, "restrict l/r analogue too, so it can't reach the
-        // top bar". Right only joins the cycle in this state; it's
-        // otherwise reached solely via its explicit triggers (X, R3, the
-        // Permissions button, …).
-        if self.context_menu_open || self.perm_editor.is_some() {
-            cycle.push(Pane::Right);
-        } else {
-            cycle.push(Pane::Toolbar);
-        }
+        cycle.push(Pane::Toolbar);
         cycle
     }
 
     /// LB/RB — move to the next/previous pane in [`Self::pane_cycle`] and
     /// restore its remembered cursor position (see [`Self::focus_pane`]).
     fn switch_pane(&mut self, ctx: &egui::Context, delta: isize) {
+        // LB/RB is fully disabled — not just restricted — while Actions
+        // and/or Permissions is open. Progress alone doesn't count: it's a
+        // plain display, nothing to interact with, so no reason to trap
+        // focus there.
+        if self.context_menu_open || self.perm_editor.is_some() {
+            return;
+        }
         let cycle = self.pane_cycle();
         if cycle.is_empty() {
             return;
         }
-        let current = self.focused_pane(ctx);
+        let current = self.current_pane;
         let idx = current.and_then(|p| cycle.iter().position(|c| *c == p));
         let next = match idx {
             Some(i) => (i as isize + delta).rem_euclid(cycle.len() as isize) as usize,
@@ -621,7 +793,7 @@ impl BrowDeckApp {
     /// `ScrollArea`'s own closure — that's what `Ui::scroll_with_delta`
     /// scrolls.
     fn apply_pending_scroll(&self, ui: &egui::Ui, pane: Pane) {
-        if self.focused_pane(ui.ctx()) == Some(pane)
+        if self.current_pane == Some(pane)
             && let Some(delta) = self.pending_scroll
         {
             ui.scroll_with_delta(egui::vec2(0.0, delta));
@@ -666,51 +838,124 @@ impl BrowDeckApp {
             });
     }
 
+    /// A compact, clickable button styled like the bottom bar's badges
+    /// (small, rounded, gray) instead of a full-size default `Button` —
+    /// used throughout the Actions/Permissions/Progress strip so it reads
+    /// as one cohesive row instead of a heavier-looking separate widget.
+    fn action_badge<'a>(ui: &mut egui::Ui, content: impl egui::IntoAtoms<'a>) -> egui::Response {
+        // Scoped so it doesn't bleed into anything drawn after this badge.
+        // egui's `button_style()` computes `inner_margin` as
+        // `button_padding + expansion - bg_stroke.width` — default
+        // *inactive* stroke width is 0, but *hovered*/*active* (focus
+        // counts as `active`) is 1.0, so a badge's own allocated size
+        // shrinks/grows ~2px the instant it gains/loses focus, shifting
+        // every badge after it in the row. Giving `inactive` a same-width
+        // but transparent stroke keeps the reserved size constant across
+        // states — only the visible border color changes.
+        ui.scope(|ui| {
+            let width = ui.visuals().widgets.hovered.bg_stroke.width;
+            ui.visuals_mut().widgets.inactive.bg_stroke =
+                egui::Stroke::new(width, egui::Color32::TRANSPARENT);
+            ui.add(
+                egui::Button::new(content)
+                    .small()
+                    .corner_radius(4.0)
+                    .fill(egui::Color32::from_gray(70)),
+            )
+        })
+        .inner
+    }
+
+    /// Same look as `action_badge`, but disabled/non-interactive — used for
+    /// an action that's already been done (e.g. IProLaunch's "already in
+    /// the library" state), so it reads as a status indicator rather than
+    /// a button that happens to do nothing.
+    fn action_badge_disabled<'a>(
+        ui: &mut egui::Ui,
+        content: impl egui::IntoAtoms<'a>,
+    ) -> egui::Response {
+        ui.add_enabled(
+            false,
+            egui::Button::new(content)
+                .small()
+                .corner_radius(4.0)
+                .fill(egui::Color32::from_gray(70)),
+        )
+    }
+
+    /// Whether `path` is already a registered IProLaunch library profile —
+    /// cached per-path (`iprolaunch_status`) since checking shells out to
+    /// the CLI (`iprolaunch::is_registered`); only actually re-runs it when
+    /// `path` differs from whatever was last checked.
+    fn iprolaunch_registered(&mut self, path: &Path) -> bool {
+        if let Some((cached_path, registered)) = &self.iprolaunch_status
+            && cached_path == path
+        {
+            return *registered;
+        }
+        let registered = self
+            .iprolaunch_bin
+            .as_deref()
+            .is_some_and(|bin| iprolaunch::is_registered(bin, path));
+        self.iprolaunch_status = Some((path.to_path_buf(), registered));
+        registered
+    }
+
     /// Persistent bottom bar: an always-visible gamepad button legend
     /// (only while a real gamepad is connected) plus the app version,
     /// rather than scattering button hints next to individual controls.
     fn show_status_bar(&self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if self.has_connected_pad() {
-                // Deliberately not `self.icon(...)` — this bar has a fixed
-                // height (`.exact_size` on its Panel) and must stay that
-                // way regardless of the icon-scale setting, unlike the
-                // toolbar (which has no fixed size and simply grows/
-                // shrinks with it).
-                ui.label(ICON_GAMEPAD.rich_text().size(BASE_ICON_SIZE));
-                ui.label("Move");
-                ui.separator();
-                Self::face_badge(ui, "A", egui::Color32::from_rgb(0x5A, 0xB4, 0x4B));
-                ui.label("Open");
-                Self::face_badge(ui, "B", egui::Color32::from_rgb(0xD1, 0x4A, 0x4A));
-                ui.label("Back/Up dir");
-                Self::face_badge(ui, "X", egui::Color32::from_rgb(0x3D, 0x7E, 0xD6));
-                ui.label("Actions");
-                Self::face_badge(ui, "Y", egui::Color32::from_rgb(0xD9, 0xB4, 0x33));
-                ui.label("Refresh (hold: Search)");
-                ui.separator();
-                Self::key_badge(ui, "LB/RB");
-                ui.label("Pane");
-                Self::key_badge(ui, "LT/RT");
-                ui.label("Zoom");
-                Self::key_badge(ui, "L3");
-                ui.label("Multi-select");
-                Self::key_badge(ui, "R3/Start");
-                ui.label("Open");
-                Self::key_badge(ui, "Select");
-                ui.label("Preview width");
-                if self.multi_select {
+        // `ui.horizontal` centers cross-axis relative to a small initial
+        // height *guess* (`spacing().interact_size.y`), not the Panel's
+        // real fixed height — so content visually hugged the top of the
+        // (taller) 36px band instead of sitting centered in it. Explicitly
+        // allocating the full available height first fixes that.
+        let full_size = ui.available_size();
+        ui.allocate_ui_with_layout(
+            full_size,
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                if self.has_connected_pad() {
+                    // Deliberately not `self.icon(...)` — this bar has a fixed
+                    // height (`.exact_size` on its Panel) and must stay that
+                    // way regardless of the icon-scale setting, unlike the
+                    // toolbar (which has no fixed size and simply grows/
+                    // shrinks with it).
+                    ui.label(ICON_GAMEPAD.rich_text().size(BASE_ICON_SIZE));
+                    ui.label("Move");
                     ui.separator();
-                    ui.colored_label(
-                        egui::Color32::from_rgb(100, 150, 255),
-                        format!("Multi-select: {} selected", self.multi_selected.len()),
-                    );
+                    Self::face_badge(ui, "A", egui::Color32::from_rgb(0x5A, 0xB4, 0x4B));
+                    ui.label("Open");
+                    Self::face_badge(ui, "B", egui::Color32::from_rgb(0xD1, 0x4A, 0x4A));
+                    ui.label("Back/Up dir");
+                    Self::face_badge(ui, "X", egui::Color32::from_rgb(0x3D, 0x7E, 0xD6));
+                    ui.label("Actions");
+                    Self::face_badge(ui, "Y", egui::Color32::from_rgb(0xD9, 0xB4, 0x33));
+                    ui.label("Refresh (hold: Search)");
+                    ui.separator();
+                    Self::key_badge(ui, "LB/RB");
+                    ui.label("Pane");
+                    Self::key_badge(ui, "LT/RT");
+                    ui.label("Zoom");
+                    Self::key_badge(ui, "L3");
+                    ui.label("Multi-select");
+                    Self::key_badge(ui, "R3/Start");
+                    ui.label("Open");
+                    Self::key_badge(ui, "Select");
+                    ui.label("Preview width");
+                    if self.multi_select {
+                        ui.separator();
+                        ui.colored_label(
+                            egui::Color32::from_rgb(100, 150, 255),
+                            format!("Multi-select: {} selected", self.multi_selected.len()),
+                        );
+                    }
                 }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.weak(format!("v{}", env!("CARGO_PKG_VERSION")));
-            });
-        });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.weak(format!("v{}", env!("CARGO_PKG_VERSION")));
+                });
+            },
+        );
     }
 
     /// Gamepad R3 and the actions panel's "Open" button.
@@ -754,7 +999,9 @@ impl BrowDeckApp {
         let center = ctx.read_response(id)?.rect.center();
         if self.sidebar_rect.is_some_and(|r| r.contains(center)) {
             Some(Pane::Sidebar)
-        } else if self.right_rect.is_some_and(|r| r.contains(center)) {
+        } else if self.right_rect.is_some_and(|r| r.contains(center))
+            || self.actions_strip_rect.is_some_and(|r| r.contains(center))
+        {
             Some(Pane::Right)
         } else if self.toolbar_rect.is_some_and(|r| r.contains(center)) {
             Some(Pane::Toolbar)
@@ -766,9 +1013,8 @@ impl BrowDeckApp {
     }
 
     /// Marks the active pane by dimming every *other* pane instead of
-    /// drawing a border on the active one — a border read as distracting
-    /// (user feedback, 2026-09-08); dimming the rest is calmer and still
-    /// unambiguous. `active` should already account for whether a gamepad
+    /// drawing a border on the active one — calmer and still unambiguous.
+    /// `active` should already account for whether a gamepad
     /// is connected at all (see call sites) — mouse-only use never sets
     /// egui focus just by clicking, so unconditionally dimming "whatever
     /// isn't focused" would leave the whole app permanently dimmed for a
@@ -821,7 +1067,15 @@ impl eframe::App for BrowDeckApp {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
 
-        let focused_pane = self.focused_pane(ui.ctx());
+        self.enforce_strip_focus_guard(ui.ctx());
+        // Only update `current_pane` when a live classification actually
+        // succeeds — see its field doc comment for why a `None` here
+        // (typically the focused widget having scrolled off-screen) must
+        // not overwrite it.
+        if let Some(pane) = self.focused_pane(ui.ctx()) {
+            self.current_pane = Some(pane);
+        }
+        let focused_pane = self.current_pane;
         // Reset every frame — only set again below if the right stick is
         // actually tilted past the deadzone this frame.
         self.pending_scroll = None;
@@ -914,15 +1168,53 @@ impl eframe::App for BrowDeckApp {
                     gamepad::Action::ScaleUp => self.scale_up(),
                     gamepad::Action::Open => self.open_selected(),
                     gamepad::Action::Scroll(amount) => {
-                        // Stashed here and applied via `Ui::scroll_with_delta`
-                        // from inside whichever pane's `ScrollArea` is
-                        // currently focused — a synthetic `MouseWheel`
-                        // event alone doesn't work (see NOTES.md, "gamepad
-                        // scrolling needs `scroll_with_delta`, not a fake
-                        // pointer hover"): egui only computes pointer hover
-                        // once per pass, at its very start, so an event
-                        // pushed mid-frame here is too late to affect it.
-                        self.pending_scroll = Some(amount * SCROLL_SPEED);
+                        match focused_pane {
+                            Some(Pane::Sidebar) | Some(Pane::Active) => {
+                                // Right-stick scroll moves the actual
+                                // selection here, not a free-floating view
+                                // offset — letting the two drift apart made
+                                // `scroll_to_me` (fired whenever focus does
+                                // move) and manual `scroll_with_delta`
+                                // fight each other. `Action::Scroll` fires
+                                // every frame the stick is tilted (not
+                                // edge-triggered like the d-pad), so it's
+                                // throttled to `SCROLL_MOVE_INTERVAL`
+                                // instead of moving a row every frame. Same
+                                // sign convention as the left stick's
+                                // Up/Down (`handle_axis` in gamepad.rs):
+                                // positive Y = Up.
+                                let now = std::time::Instant::now();
+                                let ready = self
+                                    .scroll_move_last
+                                    .is_none_or(|t| now.duration_since(t) >= SCROLL_MOVE_INTERVAL);
+                                if ready {
+                                    let dir = if amount > 0.0 {
+                                        egui::FocusDirection::Up
+                                    } else {
+                                        egui::FocusDirection::Down
+                                    };
+                                    self.ensure_focus_anchor(ui.ctx());
+                                    self.move_focus_confined(ui.ctx(), dir);
+                                    self.scroll_move_last = Some(now);
+                                }
+                            }
+                            _ => {
+                                // Stashed here and applied via
+                                // `Ui::scroll_with_delta` from inside
+                                // whichever pane's `ScrollArea` is
+                                // currently focused — a synthetic
+                                // `MouseWheel` event alone doesn't work
+                                // (see NOTES.md, "gamepad scrolling needs
+                                // `scroll_with_delta`, not a fake pointer
+                                // hover"): egui only computes pointer
+                                // hover once per pass, at its very start,
+                                // so an event pushed mid-frame here is too
+                                // late to affect it. No "selection" concept
+                                // for the Right pane's Preview/Actions
+                                // content, so this still free-scrolls.
+                                self.pending_scroll = Some(amount * SCROLL_SPEED);
+                            }
+                        }
                     }
                 }
             }
@@ -932,17 +1224,49 @@ impl eframe::App for BrowDeckApp {
             Self::paint_pane_highlight(ui, self.pane_undimmed(focused_pane, Pane::Toolbar));
             let mut toolbar_ids = Vec::new();
             ui.horizontal(|ui| {
-                let hamburger = ui.button(self.icon(ICON_MENU));
+                let hamburger = ui
+                    .button(self.icon(ICON_MENU))
+                    .on_hover_text("Show/hide the sidebar");
                 if hamburger.clicked() {
                     self.sidebar_open = !self.sidebar_open;
                 }
                 self.top_focus_id = hamburger.id;
                 toolbar_ids.push(hamburger.id);
-                let up = ui.button((self.icon(ICON_ARROW_UPWARD), "Up"));
+                let up = ui
+                    .button((self.icon(ICON_ARROW_UPWARD), "Up"))
+                    .on_hover_text("Go up a directory");
                 if up.clicked() {
                     self.go_back();
                 }
                 toolbar_ids.push(up.id);
+                let refresh_mounts = ui
+                    .button(self.icon(ICON_REFRESH))
+                    .on_hover_text("Refresh mounts");
+                if refresh_mounts.clicked() {
+                    self.mounts = mounts::list_mounts();
+                }
+                toolbar_ids.push(refresh_mounts.id);
+                let show_all = ui
+                    .selectable_label(
+                        self.show_all_mounts,
+                        self.icon(if self.show_all_mounts {
+                            ICON_VISIBILITY
+                        } else {
+                            ICON_VISIBILITY_OFF
+                        }),
+                    )
+                    .on_hover_text("Show all mounts, not just common locations");
+                if show_all.clicked() {
+                    self.show_all_mounts = !self.show_all_mounts;
+                }
+                toolbar_ids.push(show_all.id);
+                let hidden = ui
+                    .selectable_label(self.show_hidden_files, self.icon(ICON_PRIORITY_HIGH))
+                    .on_hover_text("Show hidden files");
+                if hidden.clicked() {
+                    self.show_hidden_files = !self.show_hidden_files;
+                }
+                toolbar_ids.push(hidden.id);
                 ui.separator();
                 let zoom_out = ui
                     .add_enabled(
@@ -974,28 +1298,6 @@ impl eframe::App for BrowDeckApp {
                 }
                 toolbar_ids.push(preview.id);
                 ui.separator();
-                let refresh_mounts = ui
-                    .button(self.icon(ICON_REFRESH))
-                    .on_hover_text("Refresh mounts");
-                if refresh_mounts.clicked() {
-                    self.mounts = mounts::list_mounts();
-                }
-                toolbar_ids.push(refresh_mounts.id);
-                let show_all = ui
-                    .selectable_label(
-                        self.show_all_mounts,
-                        self.icon(if self.show_all_mounts {
-                            ICON_VISIBILITY
-                        } else {
-                            ICON_VISIBILITY_OFF
-                        }),
-                    )
-                    .on_hover_text("Show all mounts, not just common locations");
-                if show_all.clicked() {
-                    self.show_all_mounts = !self.show_all_mounts;
-                }
-                toolbar_ids.push(show_all.id);
-                ui.separator();
                 match self.view {
                     View::Dir => ui.label(self.current_dir.to_string_lossy()),
                     View::Trash => ui.label("Trash"),
@@ -1012,16 +1314,13 @@ impl eframe::App for BrowDeckApp {
         });
         self.toolbar_rect = Some(toolbar_resp.response.rect);
 
-        egui::Panel::bottom("status_bar")
-            .exact_size(36.0)
-            .show(ui, |ui| self.show_status_bar(ui));
-
         if self.sidebar_open {
             let resp = egui::Panel::left("sidebar").show(ui, |ui| {
                 Self::paint_pane_highlight(ui, self.pane_undimmed(focused_pane, Pane::Sidebar));
                 egui::ScrollArea::vertical()
                     .id_salt("sidebar_list")
                     .auto_shrink([false, false])
+                    .scroll_bar_visibility(ALWAYS_VISIBLE_SCROLLBAR)
                     .show(ui, |ui| self.show_sidebar_contents(ui));
             });
             self.sidebar_rect = Some(resp.response.rect);
@@ -1039,76 +1338,129 @@ impl eframe::App for BrowDeckApp {
         let show_actions = self.context_menu_open;
         let show_permissions = self.perm_editor.is_some();
         let show_progress = !self.jobs.is_empty();
-        // Only reserve the right pane's screen space when it actually has
-        // something to show — otherwise it's just an empty strip.
-        if preview_visible || show_actions || show_permissions || show_progress {
-            let mut right_panel = egui::Panel::right("right_pane");
-            if self.preview_wide {
-                right_panel = right_panel.exact_size(ui.ctx().content_rect().width() * 0.4);
-            }
+
+        // Actions/Permissions/Progress are a horizontal strip along the
+        // very bottom, above the status bar, spanning from the
+        // sidebar/main-pane border to the window's right edge (drawn
+        // *after* the sidebar so it naturally excludes that width, and
+        // *before* the right/central panels so they get whatever's left
+        // above it) — not part of the Preview pane. Rows stack in fixed
+        // priority order (Actions, Permissions, Progress), skipping
+        // whichever aren't active.
+        enum FooterZone {
+            Actions,
+            Permissions,
+            Progress,
+        }
+        let mut active_zones = Vec::new();
+        if show_actions {
+            active_zones.push(FooterZone::Actions);
+        }
+        if show_permissions {
+            active_zones.push(FooterZone::Permissions);
+        }
+        if show_progress {
+            active_zones.push(FooterZone::Progress);
+        }
+        // One compact row per zone (Progress: one row per job), badge-
+        // styled like the bottom bar, instead of a tall boxed grid.
+        const ROW_HEIGHT: f32 = 36.0;
+        const STATUS_BAR_HEIGHT: f32 = 36.0;
+        let total_rows: usize = active_zones
+            .iter()
+            .map(|zone| match zone {
+                FooterZone::Progress => self.jobs.len().max(1),
+                _ => 1,
+            })
+            .sum();
+        let strip_height = if active_zones.is_empty() {
+            0.0
+        } else {
+            (ROW_HEIGHT * total_rows as f32 + 8.0).min(220.0)
+        };
+        // The strip and the status bar are laid out inside a *single*
+        // bottom Panel rather than two separate stacked `Panel::bottom`
+        // calls. Stacking a third `Panel::bottom` (after `status_bar`,
+        // then `sidebar`'s left panel) inside the same `ui` produced a
+        // panel whose content `ui.max_rect()` didn't match its own
+        // `response.rect` by ~20px every frame — the content silently
+        // painted into the file list's territory and got covered by its
+        // later, opaque background fill. One Panel with internal rows
+        // sidesteps that stacked-panel negotiation bug entirely.
+        let footer_height = STATUS_BAR_HEIGHT + strip_height;
+        egui::Panel::bottom("footer")
+            .exact_size(footer_height)
+            .show(ui, |ui| {
+                if !active_zones.is_empty() {
+                    // `ui.allocate_ui(size, ...)` does *not* hard-cap the
+                    // child to `size` — per its own docs, overflowing
+                    // content gets more space, and the parent's cursor
+                    // only advances by what was actually used.
+                    // `ScrollArea::vertical()` with `auto_shrink([false,
+                    // false])`, even with `.max_height()` set, sizes
+                    // itself against a larger ambient bound than the
+                    // nested-`allocate_ui` child it was given (reported
+                    // ~64px tall against a 44px request in testing),
+                    // silently growing the footer's cursor and pushing the
+                    // status bar row down past its intended band. Fixed by
+                    // reserving the exact rect *before* building the
+                    // strip's content — `allocate_rect` advances the
+                    // parent's cursor by exactly `strip_height` regardless
+                    // of what the child does, and the child `Ui`'s
+                    // `clip_rect` matches so nothing can visually bleed
+                    // past it either.
+                    let mut strip_rect = ui.available_rect_before_wrap();
+                    strip_rect.set_height(strip_height);
+                    ui.allocate_rect(strip_rect, egui::Sense::hover());
+                    let mut strip_ui = ui.new_child(egui::UiBuilder::new().max_rect(strip_rect));
+                    strip_ui.set_clip_rect(strip_rect);
+                    Self::paint_pane_highlight(
+                        &strip_ui,
+                        self.pane_undimmed(focused_pane, Pane::Right),
+                    );
+                    egui::ScrollArea::vertical()
+                        .id_salt("actions_strip_scroll")
+                        .auto_shrink([false, false])
+                        .scroll_bar_visibility(ALWAYS_VISIBLE_SCROLLBAR)
+                        .max_height(strip_height)
+                        .show(&mut strip_ui, |ui| {
+                            self.apply_pending_scroll(ui, Pane::Right);
+                            self.right_focus_rows.clear();
+                            for zone in &active_zones {
+                                match zone {
+                                    FooterZone::Actions => self.show_actions_zone(ui),
+                                    FooterZone::Permissions => self.show_permission_editor(ui),
+                                    FooterZone::Progress => self.show_progress_zone(ui),
+                                }
+                            }
+                        });
+                    self.actions_strip_rect = Some(strip_rect);
+                } else {
+                    self.actions_strip_rect = None;
+                }
+                self.show_status_bar(ui);
+            });
+
+        // Preview is its own right-docked pane, independent of the strip
+        // above — Select only ever resizes *this*.
+        if preview_visible {
+            // Always pin an exact width — an exact_size() panel's width is
+            // *remembered* across frames (`ctx` state keyed by "right_pane"),
+            // so only setting it while `preview_wide` is true and skipping
+            // the call otherwise never reverted anything: with no new
+            // constraint given, the panel just kept the last exact_size it
+            // was ever given. Both states now set one explicitly.
+            let width = if self.preview_wide {
+                ui.ctx().content_rect().width() * 0.4
+            } else {
+                PREVIEW_NORMAL_WIDTH
+            };
+            let right_panel = egui::Panel::right("right_pane").exact_size(width);
             let right_resp = right_panel.show(ui, |ui| {
                 Self::paint_pane_highlight(ui, self.pane_undimmed(focused_pane, Pane::Right));
-                // Each zone below Preview sizes itself to its own content
-                // (compact, no forced percentage — a short Actions row
-                // shouldn't leave a blank gap under it) and anchors to the
-                // *bottom* of the pane, working inward: Progress first (so
-                // it's always the very bottom-most), then Permissions,
-                // then Actions — each of those claims the next slice up
-                // from whatever's left. Preview then fills all the
-                // remaining space above them, however much or little that
-                // is (even the whole pane, if none of the others are
-                // showing). See NOTES.md "right pane zones are compact
-                // and bottom-anchored, not proportional" for why the
-                // earlier percentage-based version was replaced.
-                if show_progress {
-                    egui::Panel::bottom("right_progress_zone").show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("right_progress_scroll")
-                            // Shrink to content height (capped) instead of
-                            // always filling all given space — see NOTES.md
-                            // "right-pane zones need auto_shrink height,
-                            // not width-only" for why `[false, false]`
-                            // here fought the enclosing Panel's own
-                            // auto-fit-to-content sizing and clipped the
-                            // last row.
-                            .auto_shrink([false, true])
-                            .max_height(220.0)
-                            .show(ui, |ui| {
-                                self.apply_pending_scroll(ui, Pane::Right);
-                                self.show_progress_zone(ui);
-                                ui.add_space(4.0);
-                            });
-                    });
-                }
-                if show_permissions {
-                    egui::Panel::bottom("right_permissions_zone").show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("right_permissions_scroll")
-                            .auto_shrink([false, true])
-                            .max_height(220.0)
-                            .show(ui, |ui| {
-                                self.apply_pending_scroll(ui, Pane::Right);
-                                self.show_permission_editor(ui);
-                                ui.add_space(4.0);
-                            });
-                    });
-                }
-                if show_actions {
-                    egui::Panel::bottom("right_actions_zone").show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("right_actions_scroll")
-                            .auto_shrink([false, true])
-                            .max_height(220.0)
-                            .show(ui, |ui| {
-                                self.apply_pending_scroll(ui, Pane::Right);
-                                self.show_actions_zone(ui);
-                                ui.add_space(4.0);
-                            });
-                    });
-                }
-                if preview_visible {
-                    self.show_preview_panel(ui);
-                }
+                egui::Frame::group(ui.style())
+                    .inner_margin(8.0)
+                    .show(ui, |ui| self.show_preview_panel(ui));
             });
             self.right_rect = Some(right_resp.response.rect);
         } else {
@@ -1128,7 +1480,9 @@ impl eframe::App for BrowDeckApp {
 
 impl BrowDeckApp {
     fn show_sidebar_contents(&mut self, ui: &mut egui::Ui) {
-        self.apply_pending_scroll(ui, Pane::Sidebar);
+        // No `apply_pending_scroll` here — right-stick scroll moves the
+        // selection in this pane now (see the `Action::Scroll` handler),
+        // which drives the view via `scroll_to_me` instead.
         let mut sidebar_ids = Vec::new();
         ui.heading("Places");
         let mut clicked_place = None;
@@ -1210,7 +1564,11 @@ impl BrowDeckApp {
                     self.recursive_dirty = true;
                     self.recursive_spinner_shown = false;
                 }
-                if ui.button(self.icon(ICON_CLOSE)).clicked() {
+                if ui
+                    .button(self.icon(ICON_CLOSE))
+                    .on_hover_text("Close search")
+                    .clicked()
+                {
                     self.search_open = false;
                     self.search_query.clear();
                     self.recursive_results.clear();
@@ -1218,7 +1576,11 @@ impl BrowDeckApp {
                     self.recursive_spinner_shown = false;
                 }
             });
-        } else if ui.button(self.icon(ICON_SEARCH)).clicked() {
+        } else if ui
+            .button(self.icon(ICON_SEARCH))
+            .on_hover_text("Search this folder")
+            .clicked()
+        {
             self.search_open = true;
             self.focus_search = true;
         }
@@ -1250,8 +1612,10 @@ impl BrowDeckApp {
         egui::ScrollArea::vertical()
             .id_salt("dir_list")
             .auto_shrink([false, false])
+            .scroll_bar_visibility(ALWAYS_VISIBLE_SCROLLBAR)
             .show(ui, |ui| {
-                self.apply_pending_scroll(ui, Pane::Active);
+                // No `apply_pending_scroll` — right-stick scroll moves
+                // selection here now, which drives the view itself.
                 let query = self.search_query.to_lowercase();
                 let source: &[Entry] = if recursive_active {
                     &self.recursive_results
@@ -1264,6 +1628,9 @@ impl BrowDeckApp {
                 let mut empty_area_secondary_click = false;
                 let mut entry_ids = Vec::new();
                 for entry in source {
+                    if !self.show_hidden_files && entry.name.starts_with('.') {
+                        continue;
+                    }
                     // Recursive results are already filtered by the walk
                     // itself; only the flat (non-recursive) list needs
                     // filtering here.
@@ -1345,8 +1712,10 @@ impl BrowDeckApp {
         egui::ScrollArea::vertical()
             .id_salt("trash_list")
             .auto_shrink([false, false])
+            .scroll_bar_visibility(ALWAYS_VISIBLE_SCROLLBAR)
             .show(ui, |ui| {
-                self.apply_pending_scroll(ui, Pane::Active);
+                // No `apply_pending_scroll` — right-stick scroll moves
+                // selection here now, which drives the view itself.
                 let mut restore_idx = None;
                 let mut empty_area_secondary_click = false;
                 let mut trash_ids = Vec::new();
@@ -1414,6 +1783,7 @@ impl BrowDeckApp {
                 egui::ScrollArea::vertical()
                     .id_salt("preview_image")
                     .auto_shrink([false, false])
+                    .scroll_bar_visibility(ALWAYS_VISIBLE_SCROLLBAR)
                     .show(ui, |ui| {
                         self.apply_pending_scroll(ui, Pane::Right);
                         ui.add(egui::Image::new(preview::file_uri(&path)).shrink_to_fit());
@@ -1427,6 +1797,7 @@ impl BrowDeckApp {
                     egui::ScrollArea::vertical()
                         .id_salt("preview_text")
                         .auto_shrink([false, false])
+                        .scroll_bar_visibility(ALWAYS_VISIBLE_SCROLLBAR)
                         .show(ui, |ui| {
                             self.apply_pending_scroll(ui, Pane::Right);
                             ui.monospace(text);
@@ -1442,13 +1813,11 @@ impl BrowDeckApp {
     /// button (see NOTES.md on why: Dolphin's nested right-click menu under
     /// gamescope was the thing this app exists to not be). Lives in the
     /// right pane's lower section, revealed on demand.
+    /// Dispatches to the Dir/Trash action row — deliberately no wrapper
+    /// content of its own (title/close live in each, alongside their
+    /// buttons) so everything renders as one continuous wrapped row, not
+    /// a heading row plus a separate button row.
     fn show_actions_zone(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("Actions");
-            if ui.button(self.icon(ICON_CLOSE)).clicked() {
-                self.context_menu_open = false;
-            }
-        });
         match self.view {
             View::Dir => self.show_dir_actions(ui),
             View::Trash => self.show_trash_actions(ui),
@@ -1458,16 +1827,29 @@ impl BrowDeckApp {
     fn show_dir_actions(&mut self, ui: &mut egui::Ui) {
         let paths = self.selected_paths();
         let single = (paths.len() == 1).then(|| paths[0].clone());
-        if let Some(path) = &single {
-            ui.label(path.to_string_lossy());
-        } else if paths.len() > 1 {
-            ui.label(format!("{} items selected", paths.len()));
-        }
         let mut first_id = None;
+        let mut row_ids: Vec<egui::Id> = Vec::new();
         ui.horizontal_wrapped(|ui| {
+            let close = Self::action_badge(ui, self.icon(ICON_CLOSE));
+            row_ids.push(close.id);
+            if close.clicked() {
+                self.context_menu_open = false;
+            }
+            ui.strong("Actions");
+            if let Some(path) = &single {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                ui.weak(name).on_hover_text(path.to_string_lossy());
+            } else if paths.len() > 1 {
+                ui.weak(format!("{} items", paths.len()));
+            }
+            ui.separator();
             if self.clipboard.is_some() && self.jobs.is_empty() {
-                let r = ui.button((self.icon(ICON_CONTENT_PASTE), "Paste"));
+                let r = Self::action_badge(ui, (self.icon(ICON_CONTENT_PASTE), "Paste"));
                 first_id.get_or_insert(r.id);
+                row_ids.push(r.id);
                 if r.clicked() {
                     self.paste();
                     // Deliberately left open: the copy/move progress zone
@@ -1477,16 +1859,18 @@ impl BrowDeckApp {
             if let Some(path) = &single
                 && !path.is_dir()
             {
-                let r = ui.button((self.icon(ICON_OPEN_IN_NEW), "Open"));
+                let r = Self::action_badge(ui, (self.icon(ICON_OPEN_IN_NEW), "Open"));
                 first_id.get_or_insert(r.id);
+                row_ids.push(r.id);
                 if r.clicked() {
                     self.open_selected();
                     self.context_menu_open = false;
                 }
             }
             if !paths.is_empty() {
-                let r = ui.button((self.icon(ICON_CONTENT_COPY), "Copy"));
+                let r = Self::action_badge(ui, (self.icon(ICON_CONTENT_COPY), "Copy"));
                 first_id.get_or_insert(r.id);
+                row_ids.push(r.id);
                 if r.clicked() {
                     self.clipboard = Some(Clipboard {
                         paths: paths.clone(),
@@ -1494,8 +1878,9 @@ impl BrowDeckApp {
                     });
                     self.context_menu_open = false;
                 }
-                let r = ui.button((self.icon(ICON_CONTENT_CUT), "Cut"));
+                let r = Self::action_badge(ui, (self.icon(ICON_CONTENT_CUT), "Cut"));
                 first_id.get_or_insert(r.id);
+                row_ids.push(r.id);
                 if r.clicked() {
                     self.clipboard = Some(Clipboard {
                         paths: paths.clone(),
@@ -1503,8 +1888,9 @@ impl BrowDeckApp {
                     });
                     self.context_menu_open = false;
                 }
-                let r = ui.button((self.icon(ICON_DELETE), "Delete"));
+                let r = Self::action_badge(ui, (self.icon(ICON_DELETE), "Delete"));
                 first_id.get_or_insert(r.id);
+                row_ids.push(r.id);
                 if r.clicked() {
                     self.delete_paths(&paths);
                     self.context_menu_open = false;
@@ -1514,8 +1900,9 @@ impl BrowDeckApp {
                 && fileops::is_archive(path)
                 && self.jobs.is_empty()
             {
-                let r = ui.button((self.icon(ICON_UNARCHIVE), "Extract"));
+                let r = Self::action_badge(ui, (self.icon(ICON_UNARCHIVE), "Extract"));
                 first_id.get_or_insert(r.id);
+                row_ids.push(r.id);
                 if r.clicked() {
                     let dest_dir = self.current_dir.clone();
                     self.jobs
@@ -1525,8 +1912,9 @@ impl BrowDeckApp {
                 }
             }
             if let Some(path) = &single {
-                let r = ui.button((self.icon(ICON_LOCK), "Permissions"));
+                let r = Self::action_badge(ui, (self.icon(ICON_LOCK), "Permissions"));
                 first_id.get_or_insert(r.id);
+                row_ids.push(r.id);
                 if r.clicked()
                     && let Some(mode) = permissions::read_mode(path)
                 {
@@ -1541,17 +1929,26 @@ impl BrowDeckApp {
             }
             if let Some(path) = &single
                 && iprolaunch::is_launchable(path)
-                && let Some(bin) = &self.iprolaunch_bin
+                && self.iprolaunch_bin.is_some()
             {
-                let r = ui.button((self.icon(ICON_ROCKET_LAUNCH), "Add to IProLaunch"));
-                first_id.get_or_insert(r.id);
-                if r.clicked()
-                    && let Err(e) = iprolaunch::add(bin, path)
-                {
-                    eprintln!("IProLaunch add failed: {e}");
+                if self.iprolaunch_registered(path) {
+                    Self::action_badge_disabled(ui, (self.icon(ICON_CHECK_CIRCLE), "IProLaunch"))
+                        .on_hover_text("Already in the IProLaunch library");
+                } else {
+                    let r = Self::action_badge(ui, (self.icon(ICON_ROCKET_LAUNCH), "IProLaunch"));
+                    first_id.get_or_insert(r.id);
+                    row_ids.push(r.id);
+                    if r.clicked() {
+                        let bin = self.iprolaunch_bin.clone().unwrap();
+                        match iprolaunch::add(&bin, path) {
+                            Ok(()) => self.iprolaunch_status = Some((path.clone(), true)),
+                            Err(e) => eprintln!("IProLaunch add failed: {e}"),
+                        }
+                    }
                 }
             }
         });
+        self.right_focus_rows.push(row_ids);
         if self.focus_first_action
             && let Some(id) = first_id
         {
@@ -1562,10 +1959,19 @@ impl BrowDeckApp {
 
     fn show_trash_actions(&mut self, ui: &mut egui::Ui) {
         let mut first_id = None;
+        let mut row_ids: Vec<egui::Id> = Vec::new();
         ui.horizontal_wrapped(|ui| {
+            let close = Self::action_badge(ui, self.icon(ICON_CLOSE));
+            row_ids.push(close.id);
+            if close.clicked() {
+                self.context_menu_open = false;
+            }
+            ui.strong("Actions");
+            ui.separator();
             if let Some(i) = self.selected_trash {
-                let r = ui.button((self.icon(ICON_RESTORE_FROM_TRASH), "Restore"));
+                let r = Self::action_badge(ui, (self.icon(ICON_RESTORE_FROM_TRASH), "Restore"));
                 first_id.get_or_insert(r.id);
+                row_ids.push(r.id);
                 if r.clicked() {
                     if let Err(e) = deleted::restore(&self.trash_entries[i]) {
                         eprintln!("restore failed: {e}");
@@ -1576,8 +1982,9 @@ impl BrowDeckApp {
                 }
             }
             if !self.trash_entries.is_empty() {
-                let r = ui.button((self.icon(ICON_DELETE_SWEEP), "Empty All"));
+                let r = Self::action_badge(ui, (self.icon(ICON_DELETE_SWEEP), "Empty All"));
                 first_id.get_or_insert(r.id);
+                row_ids.push(r.id);
                 if r.clicked() {
                     if let Err(e) = deleted::empty_all() {
                         eprintln!("empty trash failed: {e}");
@@ -1588,6 +1995,7 @@ impl BrowDeckApp {
                 }
             }
         });
+        self.right_focus_rows.push(row_ids);
         if self.focus_first_action
             && let Some(id) = first_id
         {
@@ -1605,27 +2013,28 @@ impl BrowDeckApp {
         let mut mode = editor.mode;
         let path = editor.path.clone();
         let mut first_id = None;
-        ui.horizontal(|ui| {
-            ui.heading("Permissions");
-            let r = ui.button(self.icon(ICON_CLOSE));
-            first_id.get_or_insert(r.id);
-            if r.clicked() {
+        let mut row_ids: Vec<egui::Id> = Vec::new();
+        ui.horizontal_wrapped(|ui| {
+            let close = Self::action_badge(ui, self.icon(ICON_CLOSE));
+            row_ids.push(close.id);
+            if close.clicked() {
                 cancel = true;
             }
-        });
-        ui.label(path.to_string_lossy());
-        egui::Grid::new("perm_grid").show(ui, |ui| {
-            ui.label("");
-            ui.label("Read");
-            ui.label("Write");
-            ui.label("Execute");
-            ui.end_row();
+            ui.strong("Permissions");
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string_lossy().into_owned());
+            ui.weak(name).on_hover_text(path.to_string_lossy());
+            ui.separator();
             for (row_label, shift) in [("Owner", 6), ("Group", 3), ("Other", 0)] {
                 ui.label(row_label);
-                for bit in [0o4u32, 0o2, 0o1] {
+                for (bit, letter) in [(0o4u32, "R"), (0o2, "W"), (0o1, "X")] {
                     let mask = bit << shift;
                     let mut checked = mode & mask != 0;
-                    if ui.checkbox(&mut checked, "").changed() {
+                    let cb = ui.checkbox(&mut checked, letter);
+                    row_ids.push(cb.id);
+                    if cb.changed() {
                         if checked {
                             mode |= mask;
                         } else {
@@ -1633,17 +2042,21 @@ impl BrowDeckApp {
                         }
                     }
                 }
-                ui.end_row();
             }
-        });
-        ui.horizontal(|ui| {
-            if ui.button("Apply").clicked() {
+            ui.separator();
+            let apply_btn = Self::action_badge(ui, "Apply");
+            first_id.get_or_insert(apply_btn.id);
+            row_ids.push(apply_btn.id);
+            if apply_btn.clicked() {
                 apply = true;
             }
-            if ui.button("Cancel").clicked() {
+            let cancel_btn = Self::action_badge(ui, "Cancel");
+            row_ids.push(cancel_btn.id);
+            if cancel_btn.clicked() {
                 cancel = true;
             }
         });
+        self.right_focus_rows.push(row_ids);
         if apply {
             if let Err(e) = permissions::set_mode(&path, mode) {
                 eprintln!("chmod failed: {e}");
@@ -1663,15 +2076,21 @@ impl BrowDeckApp {
     }
 
     fn show_progress_zone(&self, ui: &mut egui::Ui) {
-        ui.heading("Progress");
         for job in &self.jobs {
-            if let Some(err) = &job.error {
-                ui.colored_label(egui::Color32::RED, format!("{}: {err}", job.label));
-            } else {
-                ui.label(&job.label);
-                let fraction = job.done as f32 / job.total as f32;
-                ui.add(egui::ProgressBar::new(fraction).show_percentage());
-            }
+            ui.horizontal(|ui| {
+                ui.strong("Progress");
+                if let Some(err) = &job.error {
+                    ui.colored_label(egui::Color32::RED, format!("{}: {err}", job.label));
+                } else {
+                    ui.label(&job.label);
+                    let fraction = job.done as f32 / job.total as f32;
+                    ui.add(
+                        egui::ProgressBar::new(fraction)
+                            .show_percentage()
+                            .desired_width(200.0),
+                    );
+                }
+            });
         }
     }
 }
