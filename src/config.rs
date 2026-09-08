@@ -19,7 +19,15 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            fullscreen: true,
+            // Windowed at the Deck's own native resolution, not
+            // fullscreen — real Steam Deck testing found this the
+            // reliable combination under gamescope (paired with
+            // `main.rs`/`reassert_window_size`'s explicit post-launch
+            // resize); fullscreen's own cold-launch/sizing races
+            // (see NOTES.md) were never confirmed fixed on real
+            // hardware the same way. Users who do want borderless-
+            // fullscreen behavior can still set `fullscreen = true`.
+            fullscreen: false,
             width: 1280,
             height: 800,
             show_header: true,
@@ -28,22 +36,23 @@ impl Default for Config {
 }
 
 /// Written to a fresh `config.toml` the first time BrowDeck runs with
-/// none present, so the defaults that matter for the Deck (fullscreen,
-/// the header) are visible and already set, not just implicit — the
-/// user's own request: "when first time launch, will create a default
+/// none present, so the defaults that matter (windowed size, the
+/// header) are visible and already set, not just implicit — the user's
+/// own request: "when first time launch, will create a default
 /// configuration... so this config will be changable, if user want to
-/// hide it". `width`/`height` are left commented (as in
-/// `config/config.example.toml`) since they're ignored while
-/// `fullscreen = true`.
+/// hide it". Kept in sync with `Config::default()` — see its own doc
+/// comment for why windowed 1280x800 (not fullscreen) is the default.
 const DEFAULT_CONFIG_TOML: &str = "\
 # BrowDeck configuration — generated on first launch.
 # See config.example.toml (shipped alongside the binary) for every
 # available key; this file only sets the ones that matter out of the box.
 
-# Launch fullscreen at the display's native resolution — the intended
-# mode for gamescope / Steam Game Mode. Set to false for a resizable
-# desktop window instead.
-fullscreen = true
+# Launch fullscreen at the display's native resolution. Confirmed
+# reliable on real Steam Deck hardware windowed at the size below
+# instead — set this to true if you'd rather have borderless fullscreen
+# (the intended mode for gamescope / Steam Game Mode in principle, but
+# less consistently tested).
+fullscreen = false
 
 # Thin title header above the toolbar, there to keep the toolbar's own
 # icons clear of Steam/gamescope's performance overlay. Set to false to
@@ -52,8 +61,9 @@ fullscreen = true
 show_header = true
 
 # Window size when fullscreen = false. Ignored while fullscreen = true.
-#width = 1280
-#height = 800
+# 1280x800 is the Steam Deck LCD's native resolution.
+width = 1280
+height = 800
 ";
 
 impl Config {
@@ -97,7 +107,7 @@ mod tests {
     #[test]
     fn default_config_toml_parses_and_matches_the_in_memory_default() {
         let parsed: Config = toml::from_str(DEFAULT_CONFIG_TOML).unwrap();
-        assert!(parsed.fullscreen);
+        assert!(!parsed.fullscreen);
         assert!(parsed.show_header);
         assert_eq!(parsed.width, Config::default().width);
         assert_eq!(parsed.height, Config::default().height);
@@ -119,7 +129,7 @@ mod tests {
 
         let contents = std::fs::read_to_string(&path).unwrap();
         let parsed: Config = toml::from_str(&contents).unwrap();
-        assert!(parsed.fullscreen);
+        assert!(!parsed.fullscreen);
         assert!(parsed.show_header);
 
         std::fs::remove_dir_all(&dir).unwrap();

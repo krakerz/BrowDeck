@@ -1,7 +1,28 @@
 ## [Unreleased]
 
+## [1.4.0] — 2026-09-08
+
 ### Changed
 - Relicensed from MIT to GPL-3.0-or-later
+- Quit is now R3 (a plain press), not holding Start — holding Start
+  turned out to break gamepad input on its own, regardless of what the
+  confirmation UI was; R3 previously opened the selected item, which
+  Start alone still does
+- The Quit confirmation is now a strip row (like Rename/Permissions)
+  instead of a popup
+- Default `config.toml` is now windowed at 1280x800 (Steam Deck LCD's
+  native resolution) instead of fullscreen — confirmed the reliable
+  combination on real hardware; fullscreen is still available by setting
+  `fullscreen = true`
+
+### Fixed
+- The Quit confirmation popup could break gamepad input entirely on real
+  Steam Deck hardware (switched to acting like a mouse, requiring a hard
+  restart)
+- Windowed mode could still render narrower than configured on real
+  gamescope hardware (status bar legend cut off) despite the earlier
+  cold-launch sizing fix — the window size is now re-asserted for the
+  first several frames after launch, not just requested once at creation
 
 ## [1.3.0] — 2026-09-08
 
