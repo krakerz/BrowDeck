@@ -22,16 +22,28 @@ pub fn list_places() -> Vec<Place> {
 
     let dirs_file = PathBuf::from(&home).join(".config/user-dirs.dirs");
     if let Ok(contents) = std::fs::read_to_string(&dirs_file) {
+        // Compare against the canonical form of $HOME so a trailing slash
+        // or symlink component doesn't defeat the dedup below.
+        let home_canonical = PathBuf::from(&home).canonicalize().ok();
         for (key, label, icon) in [
             ("XDG_DESKTOP_DIR", "Desktop", ICON_DESKTOP_WINDOWS),
-            ("XDG_DOCUMENTS_DIR", "Documents", ICON_ARTICLE),
             ("XDG_DOWNLOAD_DIR", "Downloads", ICON_DOWNLOAD),
+            ("XDG_DOCUMENTS_DIR", "Documents", ICON_ARTICLE),
             ("XDG_MUSIC_DIR", "Music", ICON_LIBRARY_MUSIC),
             ("XDG_PICTURES_DIR", "Pictures", ICON_IMAGE),
             ("XDG_VIDEOS_DIR", "Videos", ICON_MOVIE),
         ] {
             if let Some(path) = parse_dirs_entry(&contents, key, &home)
                 && path.is_dir()
+                // A user-dir entry that resolves to $HOME itself (seen in
+                // the wild as a misconfigured `XDG_DOWNLOAD_DIR="$HOME/"`
+                // in ~/.config/user-dirs.dirs, rather than
+                // `"$HOME/Downloads"`) would just duplicate the Home row
+                // and silently show the wrong folder — skip it rather than
+                // add a place that looks broken. This is a system
+                // config issue, not something to silently paper over by
+                // guessing a path instead.
+                && path.canonicalize().ok() != home_canonical
             {
                 places.push(Place {
                     label: label.into(),

@@ -2,8 +2,8 @@ use crate::{deleted, fileops, fonts, gamepad, mounts, permissions, places, previ
 use egui_material_icons::MaterialIcon;
 use egui_material_icons::icons::{
     ICON_ARROW_UPWARD, ICON_CLOSE, ICON_CONTENT_COPY, ICON_CONTENT_CUT, ICON_CONTENT_PASTE,
-    ICON_DELETE, ICON_DELETE_SWEEP, ICON_DESCRIPTION, ICON_FOLDER, ICON_LOCK, ICON_MENU,
-    ICON_OPEN_IN_NEW, ICON_PREVIEW, ICON_REFRESH, ICON_RESTORE_FROM_TRASH, ICON_SEARCH,
+    ICON_DELETE, ICON_DELETE_SWEEP, ICON_DESCRIPTION, ICON_FOLDER, ICON_GAMEPAD, ICON_LOCK,
+    ICON_MENU, ICON_OPEN_IN_NEW, ICON_PREVIEW, ICON_REFRESH, ICON_RESTORE_FROM_TRASH, ICON_SEARCH,
     ICON_UNARCHIVE, ICON_ZOOM_IN, ICON_ZOOM_OUT,
 };
 use std::path::PathBuf;
@@ -62,6 +62,9 @@ pub struct BrowDeckApp {
     icon_scale: f32,
     show_all_mounts: bool,
     preview_enabled: bool,
+    /// Gamepad Select toggles this — widens the right pane to 40% of the
+    /// window instead of its normal (default/resizable) width.
+    preview_wide: bool,
     /// Cached text-preview content, keyed by path so it's only re-read from
     /// disk when the selection actually changes, not every frame.
     preview_text: Option<(PathBuf, String)>,
@@ -80,10 +83,6 @@ pub struct BrowDeckApp {
     sidebar_rect: Option<egui::Rect>,
     central_rect: Option<egui::Rect>,
     right_rect: Option<egui::Rect>,
-    /// Ids of last frame's sidebar rows (Places, then Mounts, then Trash),
-    /// in on-screen order — lets the left stick jump focus directly to the
-    /// next/previous row regardless of where focus currently is.
-    sidebar_row_ids: Vec<egui::Id>,
     /// Ids of last frame's file-list rows paired with their path — used to
     /// look up which entry is focused when toggling multi-select.
     entry_ids: Vec<(egui::Id, PathBuf)>,
@@ -118,6 +117,7 @@ impl BrowDeckApp {
             icon_scale: 1.0,
             show_all_mounts: false,
             preview_enabled: false,
+            preview_wide: false,
             preview_text: None,
             context_menu_open: false,
             perm_editor: None,
@@ -129,7 +129,6 @@ impl BrowDeckApp {
             sidebar_rect: None,
             central_rect: None,
             right_rect: None,
-            sidebar_row_ids: Vec::new(),
             entry_ids: Vec::new(),
             multi_select: false,
             multi_selected: std::collections::HashSet::new(),
@@ -228,7 +227,8 @@ impl BrowDeckApp {
         }
     }
 
-    /// Gamepad L3 — always goes up a directory, regardless of open menus.
+    /// Goes up a directory (used directly by the toolbar's Up button, and
+    /// as gamepad B's fallback when there's nothing to back out of).
     fn up_directory(&mut self) {
         if matches!(self.view, View::Dir)
             && let Some(parent) = self.current_dir.parent()
@@ -239,8 +239,9 @@ impl BrowDeckApp {
 
     /// Gamepad East/B — cancels multi-select, or closes whichever menu/
     /// dialog is open, in priority order; otherwise backs out of the trash
-    /// view. Never navigates a directory up (that's L3's job).
-    fn escape(&mut self) {
+    /// view. Returns whether it closed something, so [`Self::back_or_up`]
+    /// knows whether to fall back to going up a directory instead.
+    fn escape(&mut self) -> bool {
         if self.multi_select {
             self.multi_select = false;
             self.multi_selected.clear();
@@ -251,6 +252,44 @@ impl BrowDeckApp {
         } else if matches!(self.view, View::Trash) {
             self.view = View::Dir;
             self.set_selected(None);
+        } else {
+            return false;
+        }
+        true
+    }
+
+    /// Gamepad B — combines the old East/B (close menus) and L3
+    /// (up-directory) behaviors into one button: close whatever's open, or
+    /// if nothing was, go up a directory instead. L3 was freed up for
+    /// multi-select toggling.
+    fn back_or_up(&mut self) {
+        if !self.escape() {
+            self.up_directory();
+        }
+    }
+
+    /// egui's directional focus movement (`move_focus`) only works
+    /// *relative to* an already-focused widget — with nothing focused
+    /// (fresh launch, or the previously-focused widget disappeared) it's a
+    /// silent no-op. Called right before a directional gamepad action, so
+    /// it only intervenes when gamepad nav is actually about to be used —
+    /// never on an idle frame, where it would otherwise keep fighting a
+    /// mouse-driven selection that never set keyboard focus to begin with.
+    fn ensure_focus_anchor(&self, ctx: &egui::Context) {
+        if ctx.memory(|m| m.focused()).is_none() {
+            // Prefer whatever's already selected (typically via mouse,
+            // which doesn't grant egui keyboard focus on its own — see
+            // NOTES.md) so a first d-pad/stick nudge continues on from
+            // there instead of jumping to the top of the pane, which read
+            // as the selection itself moving.
+            let fallback = self
+                .selected
+                .as_ref()
+                .and_then(|sel| self.entry_ids.iter().find(|(_, p)| p == sel))
+                .or_else(|| self.entry_ids.first())
+                .map(|(id, _)| *id)
+                .unwrap_or(self.top_focus_id);
+            ctx.memory_mut(|m| m.request_focus(fallback));
         }
     }
 
@@ -283,32 +322,89 @@ impl BrowDeckApp {
         }
     }
 
-    /// Left stick tilt — moves focus to the next/previous sidebar row
-    /// regardless of where focus currently is, so the stick can act as a
-    /// dedicated sidebar scrubber alongside the d-pad driving the focused
-    /// pane.
-    fn move_sidebar_cursor(&self, ctx: &egui::Context, delta: i32) {
-        if self.sidebar_row_ids.is_empty() {
-            return;
-        }
-        let current = ctx
-            .memory(|m| m.focused())
-            .and_then(|id| self.sidebar_row_ids.iter().position(|&r| r == id))
-            .map(|i| i as i32)
-            .unwrap_or(-1);
-        let len = self.sidebar_row_ids.len() as i32;
-        let next = (current + delta).clamp(0, len - 1) as usize;
-        let id = self.sidebar_row_ids[next];
-        ctx.memory_mut(|m| m.request_focus(id));
+    /// Whether a real gamepad is connected — gates the bottom legend bar.
+    fn has_connected_pad(&self) -> bool {
+        self.gamepad.as_ref().is_some_and(|g| g.has_connected_pad())
     }
 
-    /// Small dim badge showing a gamepad button's name next to whichever
-    /// control it directly triggers — only shown while a real pad is
-    /// connected (not just while `gilrs` is initialized).
-    fn button_hint(&self, ui: &mut egui::Ui, label: &str) {
-        if self.gamepad.as_ref().is_some_and(|g| g.has_connected_pad()) {
-            ui.weak(egui::RichText::new(format!("[{label}]")).small());
-        }
+    /// Colored circular badge for a face button (A/B/X/Y), matching
+    /// standard controller button colors.
+    fn face_badge(ui: &mut egui::Ui, letter: &str, color: egui::Color32) {
+        egui::Frame::default()
+            .fill(color)
+            .corner_radius(8.0)
+            .inner_margin(egui::Margin {
+                left: 6,
+                right: 6,
+                top: 1,
+                bottom: 1,
+            })
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(letter)
+                        .strong()
+                        .color(egui::Color32::WHITE)
+                        .size(12.0),
+                );
+            });
+    }
+
+    /// Gray rounded badge for a non-face-button control (LB/RB/LT/RT/L3/R3).
+    fn key_badge(ui: &mut egui::Ui, label: &str) {
+        egui::Frame::default()
+            .fill(egui::Color32::from_gray(70))
+            .corner_radius(4.0)
+            .inner_margin(egui::Margin {
+                left: 5,
+                right: 5,
+                top: 1,
+                bottom: 1,
+            })
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new(label).strong().size(11.0));
+            });
+    }
+
+    /// Persistent bottom control legend, shown only while a real gamepad is
+    /// connected — mirrors the "always-visible button hints" bar in
+    /// DeckCrate (this project's inspiration) rather than scattering hints
+    /// next to individual buttons.
+    fn show_gamepad_legend(&self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            // Deliberately not `self.icon(...)` — this bar has a fixed
+            // height (`.exact_size` on its Panel) and must stay that way
+            // regardless of the icon-scale setting, unlike the toolbar
+            // (which has no fixed size and simply grows/shrinks with it).
+            ui.label(ICON_GAMEPAD.rich_text().size(BASE_ICON_SIZE));
+            ui.label("Move");
+            ui.separator();
+            Self::face_badge(ui, "A", egui::Color32::from_rgb(0x5A, 0xB4, 0x4B));
+            ui.label("Open");
+            Self::face_badge(ui, "B", egui::Color32::from_rgb(0xD1, 0x4A, 0x4A));
+            ui.label("Back/Up dir");
+            Self::face_badge(ui, "X", egui::Color32::from_rgb(0x3D, 0x7E, 0xD6));
+            ui.label("Actions");
+            Self::face_badge(ui, "Y", egui::Color32::from_rgb(0xD9, 0xB4, 0x33));
+            ui.label("Search");
+            ui.separator();
+            Self::key_badge(ui, "LB/RB");
+            ui.label("Pane");
+            Self::key_badge(ui, "LT/RT");
+            ui.label("Zoom");
+            Self::key_badge(ui, "L3");
+            ui.label("Multi-select");
+            Self::key_badge(ui, "R3/Start");
+            ui.label("Open");
+            Self::key_badge(ui, "Select");
+            ui.label("Preview width");
+            if self.multi_select {
+                ui.separator();
+                ui.colored_label(
+                    egui::Color32::from_rgb(100, 150, 255),
+                    format!("Multi-select: {} selected", self.multi_selected.len()),
+                );
+            }
+        });
     }
 
     /// Gamepad R3 and the actions panel's "Open" button.
@@ -405,7 +501,18 @@ impl eframe::App for BrowDeckApp {
             ui.ctx().request_repaint_after(Duration::from_millis(16));
             for action in actions {
                 match action {
-                    gamepad::Action::Move(dir) => ui.ctx().memory_mut(|m| m.move_focus(dir)),
+                    gamepad::Action::Move(dir) => {
+                        // egui's directional focus movement only works
+                        // *relative to* an already-focused widget — if
+                        // nothing has focus (fresh launch, or mouse use left
+                        // it unset), seed one so this input isn't a silent
+                        // no-op. Only done reactively, here, not every idle
+                        // frame — otherwise it would keep stealing focus
+                        // back from a mouse-driven selection that never set
+                        // it in the first place.
+                        self.ensure_focus_anchor(ui.ctx());
+                        ui.ctx().memory_mut(|m| m.move_focus(dir));
+                    }
                     gamepad::Action::Activate => {
                         if self.multi_select && matches!(self.view, View::Dir) {
                             self.toggle_focused_entry(ui.ctx());
@@ -421,13 +528,15 @@ impl eframe::App for BrowDeckApp {
                             });
                         }
                     }
-                    gamepad::Action::EnterMultiSelect => {
+                    gamepad::Action::ToggleMultiSelect => {
                         if matches!(self.view, View::Dir) {
-                            self.multi_select = true;
+                            self.multi_select = !self.multi_select;
+                            if !self.multi_select {
+                                self.multi_selected.clear();
+                            }
                         }
                     }
-                    gamepad::Action::Back => self.escape(),
-                    gamepad::Action::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
+                    gamepad::Action::Back => self.back_or_up(),
                     gamepad::Action::ContextMenu => {
                         if self.actions_available() {
                             self.context_menu_open = true;
@@ -435,27 +544,24 @@ impl eframe::App for BrowDeckApp {
                         }
                     }
                     gamepad::Action::SwapPaneLeft => {
+                        self.ensure_focus_anchor(ui.ctx());
                         ui.ctx()
                             .memory_mut(|m| m.move_focus(egui::FocusDirection::Left));
                     }
                     gamepad::Action::SwapPaneRight => {
+                        self.ensure_focus_anchor(ui.ctx());
                         ui.ctx()
                             .memory_mut(|m| m.move_focus(egui::FocusDirection::Right));
                     }
-                    gamepad::Action::FocusTop => {
-                        let id = self.top_focus_id;
-                        ui.ctx().memory_mut(|m| m.request_focus(id));
+                    gamepad::Action::TogglePreviewWidth => {
+                        self.preview_wide = !self.preview_wide;
                     }
                     gamepad::Action::Search => {
                         self.search_open = true;
                         self.focus_search = true;
                     }
-                    gamepad::Action::SidebarMove(delta) => {
-                        self.move_sidebar_cursor(ui.ctx(), delta);
-                    }
                     gamepad::Action::ScaleDown => self.scale_down(),
                     gamepad::Action::ScaleUp => self.scale_up(),
-                    gamepad::Action::UpDirectory => self.up_directory(),
                     gamepad::Action::Open => self.open_selected(),
                     gamepad::Action::Scroll(amount) => {
                         ui.ctx().input_mut(|i| {
@@ -478,11 +584,9 @@ impl eframe::App for BrowDeckApp {
                     self.sidebar_open = !self.sidebar_open;
                 }
                 self.top_focus_id = hamburger.id;
-                self.button_hint(ui, "Start");
                 if ui.button((self.icon(ICON_ARROW_UPWARD), "Up")).clicked() {
                     self.go_back();
                 }
-                self.button_hint(ui, "L3");
                 ui.separator();
                 if ui
                     .add_enabled(
@@ -494,7 +598,6 @@ impl eframe::App for BrowDeckApp {
                 {
                     self.scale_down();
                 }
-                self.button_hint(ui, "LT");
                 if ui
                     .add_enabled(
                         self.icon_scale < *ICON_SCALE_RANGE.end(),
@@ -505,7 +608,6 @@ impl eframe::App for BrowDeckApp {
                 {
                     self.scale_up();
                 }
-                self.button_hint(ui, "RT");
                 ui.separator();
                 if ui
                     .selectable_label(self.preview_enabled, (self.icon(ICON_PREVIEW), "Preview"))
@@ -526,25 +628,26 @@ impl eframe::App for BrowDeckApp {
                         egui::Color32::from_rgb(100, 150, 255),
                         format!("Multi-select ({} selected)", self.multi_selected.len()),
                     );
-                    self.button_hint(ui, "B cancel");
                 }
             });
         });
 
+        if self.has_connected_pad() {
+            egui::Panel::bottom("gamepad_legend")
+                .exact_size(28.0)
+                .show(ui, |ui| self.show_gamepad_legend(ui));
+        }
+
         if self.sidebar_open {
-            let mut row_ids = Vec::new();
             let resp = egui::Panel::left("sidebar").show(ui, |ui| {
                 Self::paint_pane_highlight(ui, focused_pane == Some(Pane::Sidebar));
-                ui.horizontal(|ui| {
-                    ui.heading("Places");
-                    self.button_hint(ui, "Left Stick");
-                });
+                ui.heading("Places");
                 let mut clicked_place = None;
                 for place in &self.places {
-                    let r =
-                        ui.selectable_label(false, (self.icon(place.icon), place.label.as_str()));
-                    row_ids.push(r.id);
-                    if r.clicked() {
+                    if ui
+                        .selectable_label(false, (self.icon(place.icon), place.label.as_str()))
+                        .clicked()
+                    {
                         clicked_place = Some(place.path.clone());
                     }
                 }
@@ -555,8 +658,8 @@ impl eframe::App for BrowDeckApp {
                     if ui.small_button(self.icon(ICON_REFRESH)).clicked() {
                         self.mounts = mounts::list_mounts();
                     }
+                    ui.checkbox(&mut self.show_all_mounts, "Show all");
                 });
-                ui.checkbox(&mut self.show_all_mounts, "Show all");
                 let visible_mounts: Vec<&mounts::Mount> = self
                     .mounts
                     .iter()
@@ -571,7 +674,6 @@ impl eframe::App for BrowDeckApp {
                     let response = ui
                         .selectable_label(false, (self.icon(mount.icon()), mount_label.as_str()))
                         .on_hover_text(&mount.device);
-                    row_ids.push(response.id);
                     if response.clicked() {
                         clicked_mount = Some(mount.mount_point.clone());
                     }
@@ -581,58 +683,67 @@ impl eframe::App for BrowDeckApp {
                 }
 
                 ui.add_space(8.0);
-                let trash_r = ui.selectable_label(
-                    matches!(self.view, View::Trash),
-                    (self.icon(ICON_DELETE), "Trash"),
-                );
-                row_ids.push(trash_r.id);
-                if trash_r.clicked() {
+                if ui
+                    .selectable_label(
+                        matches!(self.view, View::Trash),
+                        (self.icon(ICON_DELETE), "Trash"),
+                    )
+                    .clicked()
+                {
                     self.open_trash();
                 }
             });
             self.sidebar_rect = Some(resp.response.rect);
-            self.sidebar_row_ids = row_ids;
         } else {
             self.sidebar_rect = None;
-            self.sidebar_row_ids.clear();
         }
 
-        let right_resp = egui::Panel::right("right_pane").show(ui, |ui| {
-            Self::paint_pane_highlight(ui, focused_pane == Some(Pane::Right));
-            let preview_visible = self.preview_enabled
-                && self
-                    .selected
-                    .as_deref()
-                    .and_then(preview::classify)
-                    .is_some();
-            if preview_visible {
-                ui.separator();
-                self.show_preview_panel(ui);
+        let preview_visible = self.preview_enabled
+            && self
+                .selected
+                .as_deref()
+                .and_then(preview::classify)
+                .is_some();
+        let show_actions =
+            self.context_menu_open || self.perm_editor.is_some() || !self.jobs.is_empty();
+        // Only reserve the right pane's screen space when it actually has
+        // something to show — otherwise it's just an empty strip.
+        if preview_visible || show_actions {
+            let mut right_panel = egui::Panel::right("right_pane");
+            if self.preview_wide {
+                right_panel = right_panel.exact_size(ui.ctx().content_rect().width() * 0.4);
             }
-
-            let show_actions =
-                self.context_menu_open || self.perm_editor.is_some() || !self.jobs.is_empty();
-            if show_actions {
-                ui.separator();
-                egui::ScrollArea::vertical()
-                    .id_salt("right_pane_lower")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if self.context_menu_open {
-                            self.show_actions_zone(ui);
-                            ui.add_space(8.0);
-                        }
-                        if self.perm_editor.is_some() {
-                            self.show_permission_editor(ui);
-                            ui.add_space(8.0);
-                        }
-                        if !self.jobs.is_empty() {
-                            self.show_progress_zone(ui);
-                        }
-                    });
-            }
-        });
-        self.right_rect = Some(right_resp.response.rect);
+            let right_resp = right_panel.show(ui, |ui| {
+                Self::paint_pane_highlight(ui, focused_pane == Some(Pane::Right));
+                if preview_visible {
+                    self.show_preview_panel(ui);
+                }
+                if show_actions {
+                    if preview_visible {
+                        ui.separator();
+                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt("right_pane_lower")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if self.context_menu_open {
+                                self.show_actions_zone(ui);
+                                ui.add_space(8.0);
+                            }
+                            if self.perm_editor.is_some() {
+                                self.show_permission_editor(ui);
+                                ui.add_space(8.0);
+                            }
+                            if !self.jobs.is_empty() {
+                                self.show_progress_zone(ui);
+                            }
+                        });
+                }
+            });
+            self.right_rect = Some(right_resp.response.rect);
+        } else {
+            self.right_rect = None;
+        }
 
         let central_resp = egui::CentralPanel::default().show(ui, |ui| {
             Self::paint_pane_highlight(ui, focused_pane == Some(Pane::FileList));
@@ -664,14 +775,9 @@ impl BrowDeckApp {
                     self.search_query.clear();
                 }
             });
-        } else {
-            ui.horizontal(|ui| {
-                if ui.button(self.icon(ICON_SEARCH)).clicked() {
-                    self.search_open = true;
-                    self.focus_search = true;
-                }
-                self.button_hint(ui, "Y");
-            });
+        } else if ui.button(self.icon(ICON_SEARCH)).clicked() {
+            self.search_open = true;
+            self.focus_search = true;
         }
         ui.separator();
         egui::ScrollArea::vertical()
@@ -863,12 +969,13 @@ impl BrowDeckApp {
         }
         let mut first_id = None;
         ui.horizontal_wrapped(|ui| {
-            if self.clipboard.is_some() {
+            if self.clipboard.is_some() && self.jobs.is_empty() {
                 let r = ui.button((self.icon(ICON_CONTENT_PASTE), "Paste"));
                 first_id.get_or_insert(r.id);
                 if r.clicked() {
                     self.paste();
-                    self.context_menu_open = false;
+                    // Deliberately left open: the copy/move progress zone
+                    // stacks below Actions rather than replacing it.
                 }
             }
             if let Some(path) = &single
@@ -876,7 +983,6 @@ impl BrowDeckApp {
             {
                 let r = ui.button((self.icon(ICON_OPEN_IN_NEW), "Open"));
                 first_id.get_or_insert(r.id);
-                self.button_hint(ui, "R3");
                 if r.clicked() {
                     self.open_selected();
                     self.context_menu_open = false;
@@ -910,6 +1016,7 @@ impl BrowDeckApp {
             }
             if let Some(path) = &single
                 && fileops::is_archive(path)
+                && self.jobs.is_empty()
             {
                 let r = ui.button((self.icon(ICON_UNARCHIVE), "Extract"));
                 first_id.get_or_insert(r.id);
@@ -917,20 +1024,23 @@ impl BrowDeckApp {
                     let dest_dir = self.current_dir.clone();
                     self.jobs
                         .push(fileops::spawn_extract(path.clone(), dest_dir));
-                    self.context_menu_open = false;
+                    // Deliberately left open: the extract progress zone
+                    // stacks below Actions rather than replacing it.
                 }
             }
             if let Some(path) = &single {
                 let r = ui.button((self.icon(ICON_LOCK), "Permissions"));
                 first_id.get_or_insert(r.id);
-                if r.clicked() {
-                    if let Some(mode) = permissions::read_mode(path) {
-                        self.perm_editor = Some(PermEditor {
-                            path: path.clone(),
-                            mode,
-                        });
-                    }
-                    self.context_menu_open = false;
+                if r.clicked()
+                    && let Some(mode) = permissions::read_mode(path)
+                {
+                    self.perm_editor = Some(PermEditor {
+                        path: path.clone(),
+                        mode,
+                    });
+                    self.focus_first_action = true;
+                    // Deliberately left open: the permission editor stacks
+                    // below Actions rather than replacing it.
                 }
             }
         });
@@ -986,9 +1096,12 @@ impl BrowDeckApp {
         let mut cancel = false;
         let mut mode = editor.mode;
         let path = editor.path.clone();
+        let mut first_id = None;
         ui.horizontal(|ui| {
             ui.heading("Permissions");
-            if ui.button(self.icon(ICON_CLOSE)).clicked() {
+            let r = ui.button(self.icon(ICON_CLOSE));
+            first_id.get_or_insert(r.id);
+            if r.clicked() {
                 cancel = true;
             }
         });
@@ -1032,6 +1145,12 @@ impl BrowDeckApp {
             self.perm_editor = None;
         } else {
             self.perm_editor.as_mut().unwrap().mode = mode;
+        }
+        if self.focus_first_action
+            && let Some(id) = first_id
+        {
+            ui.ctx().memory_mut(|m| m.request_focus(id));
+            self.focus_first_action = false;
         }
     }
 
