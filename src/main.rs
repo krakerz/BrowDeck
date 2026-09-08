@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod deleted;
+mod fileinfo;
 mod fileops;
 mod fonts;
 mod gamepad;
