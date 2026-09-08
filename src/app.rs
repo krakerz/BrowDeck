@@ -1,4 +1,6 @@
-use crate::{deleted, fileops, fonts, gamepad, iprolaunch, mounts, permissions, places, preview};
+use crate::{
+    deleted, fileinfo, fileops, fonts, gamepad, iprolaunch, mounts, permissions, places, preview,
+};
 use egui_material_icons::MaterialIcon;
 use egui_material_icons::icons::{
     ICON_ACCOUNT_TREE, ICON_ARROW_UPWARD, ICON_CHECK_CIRCLE, ICON_CLOSE, ICON_CONTENT_COPY,
@@ -28,6 +30,11 @@ const SCROLL_SPEED: f32 = 12.0;
 const SCROLL_MOVE_INTERVAL: Duration = Duration::from_millis(51);
 /// The right pane's width when Select's preview-width toggle is off.
 const PREVIEW_NORMAL_WIDTH: f32 = 320.0;
+/// Fixed height of the sidebar's selected-item info card — deliberately
+/// not auto-fit (see NOTES.md's running lesson on that), and internally
+/// scrollable so a long symlink target or a mounts list squeezing it
+/// doesn't overflow.
+const SIDEBAR_INFO_HEIGHT: f32 = 150.0;
 
 struct Entry {
     name: String,
@@ -41,7 +48,9 @@ struct Clipboard {
 }
 
 struct PermEditor {
-    path: PathBuf,
+    /// One file, or every path in a multi-selection — Apply sets the same
+    /// mode on all of them.
+    paths: Vec<PathBuf>,
     mode: u32,
 }
 
@@ -187,6 +196,11 @@ pub struct BrowDeckApp {
     iprolaunch_status: Option<(PathBuf, bool)>,
     multi_select: bool,
     multi_selected: std::collections::HashSet<PathBuf>,
+    /// Cached `fileinfo::compute` result for the sidebar's info card, keyed
+    /// by path — a directory's size is a bounded but potentially slow
+    /// recursive walk, so this is only recomputed when the selection
+    /// actually changes, not every frame the card is drawn.
+    selected_info: Option<(PathBuf, fileinfo::FileInfo)>,
     /// The last pane `focused_pane()` was able to classify — "sticky"
     /// across frames where it returns `None`. `focused_pane()` checks
     /// whether the *focused widget's* on-screen rect falls inside a pane's
@@ -259,6 +273,7 @@ impl BrowDeckApp {
             recursive_spinner_shown: false,
             iprolaunch_bin: iprolaunch::detect_bin(),
             iprolaunch_status: None,
+            selected_info: None,
             multi_select: false,
             multi_selected: std::collections::HashSet::new(),
             current_pane: None,
@@ -544,11 +559,10 @@ impl BrowDeckApp {
     /// never letting a direction press leave that pane (that's LB/RB's
     /// job now, see [`Self::switch_pane`]). Sidebar/Active are vertical
     /// lists (Up/Down move; Left/Right are no-ops); Toolbar is a
-    /// horizontal row (the reverse). Right pane's content shape varies too
-    /// much (button rows, a permission grid, progress bars) for a single
-    /// flat order to make sense, so it keeps using egui's own geometric
-    /// search — its contents are small/self-contained enough in practice
-    /// that this hasn't been observed to leak into neighboring panes.
+    /// horizontal row (the reverse). The Actions/Permissions strip
+    /// (`Pane::Right`) index-steps through `right_focus_rows`; Preview/
+    /// Progress (also `Pane::Right`, when the strip isn't open) have no
+    /// navigable content at all, so the d-pad is just a no-op there.
     fn move_focus_confined(&mut self, ctx: &egui::Context, dir: egui::FocusDirection) {
         // While Actions and/or Permissions is open, step through
         // `right_focus_rows` by index instead of egui's geometric
@@ -632,10 +646,16 @@ impl BrowDeckApp {
             return;
         };
         if pane == Pane::Right {
-            // Not guarded here (Progress-only, or the Preview pane) — keep
-            // using egui's own geometric search; see the doc comment on
-            // `pane_ids` for why Right doesn't get a flat confined order.
-            ctx.memory_mut(|m| m.move_focus(dir));
+            // Reached here means the strip isn't open (that's the guarded
+            // branch above) — so this is either Preview or a Progress-
+            // only display, neither of which has real navigable content
+            // for the d-pad (only the right stick scrolls Preview).
+            // Deliberately a no-op rather than falling back to egui's
+            // geometric `move_focus`: that has no concept of the pane
+            // boundary and can walk focus straight into the file list —
+            // the same class of leak fixed for the Actions/Permissions
+            // strip, just via a different mechanism since there's no
+            // list of ids to index-step through here.
             return;
         }
         let delta: isize = match (pane, dir) {
@@ -661,14 +681,31 @@ impl BrowDeckApp {
         }
     }
 
-    /// The panes LB/RB cycle between, in order — Right is deliberately
-    /// excluded (reached only via explicit triggers: X, R3, Permissions…).
+    /// Whether the Preview pane is currently showing (enabled, and the
+    /// selection is a previewable image/text file).
+    fn preview_visible(&self) -> bool {
+        self.preview_enabled
+            && self
+                .selected
+                .as_deref()
+                .and_then(preview::classify)
+                .is_some()
+    }
+
+    /// The panes LB/RB cycle between, in order. Right/Preview is included
+    /// only while it's actually showing; the Actions/Permissions strip
+    /// (also `Pane::Right`) stays reachable only via its own explicit
+    /// triggers (X, R3, Permissions), never LB/RB — moot anyway, since
+    /// `switch_pane` fully disables LB/RB while it's open.
     fn pane_cycle(&self) -> Vec<Pane> {
         let mut cycle = Vec::new();
         if self.sidebar_open {
             cycle.push(Pane::Sidebar);
         }
         cycle.push(Pane::Active);
+        if self.preview_visible() {
+            cycle.push(Pane::Right);
+        }
         cycle.push(Pane::Toolbar);
         cycle
     }
@@ -705,7 +742,26 @@ impl BrowDeckApp {
             Pane::Sidebar => self.sidebar_last_focus,
             Pane::Active => self.active_last_focus,
             Pane::Toolbar => self.toolbar_last_focus,
-            Pane::Right => self.right_last_focus,
+            // `right_last_focus` is shared with the Actions/Permissions
+            // strip (also `Pane::Right`) — LB/RB can only ever reach
+            // Right while that strip is closed (switch_pane blocks LB/RB
+            // entirely while it's open), so if `right_last_focus` still
+            // points at a strip widget, that widget is *always* gone by
+            // now and `read_response` will confirm it. Falling back to
+            // Preview's own focus anchor in that case (or the first time
+            // ever, when nothing's been focused there yet) — same class
+            // of stale-focus bug as the escape()-priority fix, just a
+            // different path to the same dangling id.
+            Pane::Right => {
+                let still_valid = self
+                    .right_last_focus
+                    .is_some_and(|id| ctx.read_response(id).is_some());
+                if still_valid {
+                    self.right_last_focus
+                } else {
+                    Some(Self::preview_focus_id())
+                }
+            }
         };
         // Right has no tracked id list (see `pane_ids`), so there's
         // nothing to validate `remembered` against — just trust it
@@ -899,6 +955,16 @@ impl BrowDeckApp {
             .is_some_and(|bin| iprolaunch::is_registered(bin, path));
         self.iprolaunch_status = Some((path.to_path_buf(), registered));
         registered
+    }
+
+    /// `fileinfo::compute(path)`, cached per-path — see `selected_info`'s
+    /// field doc comment for why.
+    fn selected_info(&mut self, path: &Path) -> &fileinfo::FileInfo {
+        let needs_recompute = !matches!(&self.selected_info, Some((p, _)) if p == path);
+        if needs_recompute {
+            self.selected_info = Some((path.to_path_buf(), fileinfo::compute(path)));
+        }
+        &self.selected_info.as_ref().unwrap().1
     }
 
     /// Persistent bottom bar: an always-visible gamepad button legend
@@ -1350,13 +1416,30 @@ impl eframe::App for BrowDeckApp {
         self.toolbar_rect = Some(toolbar_resp.response.rect);
 
         if self.sidebar_open {
+            // Single-selection only ("multi select doesn't count") — the
+            // card's own fixed height is carved out of the sidebar before
+            // the scrollable Places/Mounts/Trash list, same "reserve the
+            // exact rect first" approach as the Actions/Permissions strip
+            // (see its own comment for why `allocate_ui` alone isn't
+            // reliable for this).
+            let show_info =
+                !self.multi_select && self.selected.is_some() && matches!(self.view, View::Dir);
             let resp = egui::Panel::left("sidebar").show(ui, |ui| {
                 Self::paint_pane_highlight(ui, self.pane_undimmed(focused_pane, Pane::Sidebar));
+                let info_height = if show_info { SIDEBAR_INFO_HEIGHT } else { 0.0 };
+                let mut list_rect = ui.available_rect_before_wrap();
+                list_rect.set_height((list_rect.height() - info_height).max(0.0));
+                ui.allocate_rect(list_rect, egui::Sense::hover());
+                let mut list_ui = ui.new_child(egui::UiBuilder::new().max_rect(list_rect));
+                list_ui.set_clip_rect(list_rect);
                 egui::ScrollArea::vertical()
                     .id_salt("sidebar_list")
                     .auto_shrink([false, false])
                     .scroll_bar_visibility(ALWAYS_VISIBLE_SCROLLBAR)
-                    .show(ui, |ui| self.show_sidebar_contents(ui));
+                    .show(&mut list_ui, |ui| self.show_sidebar_contents(ui));
+                if show_info {
+                    self.show_selected_info(ui);
+                }
             });
             self.sidebar_rect = Some(resp.response.rect);
         } else {
@@ -1364,12 +1447,7 @@ impl eframe::App for BrowDeckApp {
             self.sidebar_ids.clear();
         }
 
-        let preview_visible = self.preview_enabled
-            && self
-                .selected
-                .as_deref()
-                .and_then(preview::classify)
-                .is_some();
+        let preview_visible = self.preview_visible();
         let show_actions = self.context_menu_open;
         let show_permissions = self.perm_editor.is_some();
         let show_progress = !self.jobs.is_empty();
@@ -1572,6 +1650,46 @@ impl BrowDeckApp {
             self.open_trash();
         }
         self.sidebar_ids = sidebar_ids;
+    }
+
+    /// Basic info for the single selected file/folder — name, owner,
+    /// group, size, permissions, and (if a symlink) what it points to.
+    /// A passive display, nothing here is interactive or focusable — just
+    /// a top separator line (like a section break elsewhere in the app),
+    /// not a full boxed frame.
+    fn show_selected_info(&mut self, ui: &mut egui::Ui) {
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt("selected_info_scroll")
+            .auto_shrink([false, false])
+            .scroll_bar_visibility(ALWAYS_VISIBLE_SCROLLBAR)
+            .show(ui, |ui| {
+                let info = self.selected_info(&path);
+                ui.add(egui::Label::new(egui::RichText::new(&info.name).strong()).truncate())
+                    .on_hover_text(&info.name);
+                // Right-space-padded to "Owner"/"Group"'s width (5 — the
+                // longest of just these three, Permissions excluded) so
+                // the colons line up — needs a monospace font to
+                // actually align on screen; the app's regular
+                // proportional font can't align via padding spaces
+                // alone.
+                ui.monospace(format!("{:<5} : {}", "Owner", info.owner));
+                ui.monospace(format!("{:<5} : {}", "Group", info.group));
+                ui.monospace(format!("{:<5} : {}", "Size", info.size));
+                // No label — the mode string alone (e.g. `rwxr-xr-x`) is
+                // self-explanatory.
+                ui.monospace(info.permissions.as_str());
+                if let Some(target) = &info.symlink_target {
+                    // No "Real path:" label and no `.truncate()` — plain
+                    // `ui.label` wraps by default, so the full target is
+                    // visible across multiple lines instead of being cut
+                    // off with an ellipsis.
+                    ui.label(target);
+                }
+            });
     }
 
     fn show_dir(&mut self, ui: &mut egui::Ui) {
@@ -1803,7 +1921,27 @@ impl BrowDeckApp {
             });
     }
 
+    /// Stable id for Preview's own focus anchor — Preview has no list of
+    /// navigable widgets (just scrollable content), so this stands in for
+    /// "Preview has focus" the same way `top_focus_id` stands in for the
+    /// toolbar's hamburger button.
+    fn preview_focus_id() -> egui::Id {
+        egui::Id::new("preview_focus_anchor")
+    }
+
     fn show_preview_panel(&mut self, ui: &mut egui::Ui) {
+        // `focusable_noninteractive()` — no click/drag sense, so this
+        // can't steal pointer interaction from anything drawn after it —
+        // just gives LB/RB something to focus so Preview can be reached
+        // and classified as `Pane::Right` like everything else.
+        let anchor = ui.interact(
+            ui.max_rect(),
+            Self::preview_focus_id(),
+            egui::Sense::focusable_noninteractive(),
+        );
+        if self.scroll_to_focus == Some(anchor.id) {
+            self.scroll_to_focus = None;
+        }
         ui.heading("Preview");
         let Some(path) = self.selected.clone() else {
             return;
@@ -1946,15 +2084,20 @@ impl BrowDeckApp {
                     // stacks below Actions rather than replacing it.
                 }
             }
-            if let Some(path) = &single {
+            if !paths.is_empty() {
                 let r = Self::action_badge(ui, (self.icon(ICON_LOCK), "Permissions"));
                 first_id.get_or_insert(r.id);
                 row_ids.push(r.id);
+                // Multi-selection: applies one mode to every selected
+                // path on Apply. Initial checkbox state comes from just
+                // the first path — they may not all start out the same,
+                // but Apply always sets the same mode on all of them
+                // regardless of what each one started as.
                 if r.clicked()
-                    && let Some(mode) = permissions::read_mode(path)
+                    && let Some(mode) = permissions::read_mode(&paths[0])
                 {
                     self.perm_editor = Some(PermEditor {
-                        path: path.clone(),
+                        paths: paths.clone(),
                         mode,
                     });
                     self.focus_first_action = true;
@@ -2046,7 +2189,7 @@ impl BrowDeckApp {
         let mut apply = false;
         let mut cancel = false;
         let mut mode = editor.mode;
-        let path = editor.path.clone();
+        let paths = editor.paths.clone();
         let mut first_id = None;
         let mut row_ids: Vec<egui::Id> = Vec::new();
         ui.horizontal_wrapped(|ui| {
@@ -2056,11 +2199,15 @@ impl BrowDeckApp {
                 cancel = true;
             }
             ui.strong("Permissions");
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.to_string_lossy().into_owned());
-            ui.weak(name).on_hover_text(path.to_string_lossy());
+            if let [path] = paths.as_slice() {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                ui.weak(name).on_hover_text(path.to_string_lossy());
+            } else {
+                ui.weak(format!("{} items", paths.len()));
+            }
             ui.separator();
             for (row_label, shift) in [("Owner", 6), ("Group", 3), ("Other", 0)] {
                 ui.label(row_label);
@@ -2093,8 +2240,10 @@ impl BrowDeckApp {
         });
         self.right_focus_rows.push(row_ids);
         if apply {
-            if let Err(e) = permissions::set_mode(&path, mode) {
-                eprintln!("chmod failed: {e}");
+            for path in &paths {
+                if let Err(e) = permissions::set_mode(path, mode) {
+                    eprintln!("chmod failed for {}: {e}", path.display());
+                }
             }
             self.perm_editor = None;
         } else if cancel {
