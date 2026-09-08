@@ -22,6 +22,7 @@ and getting blurred.
 - Sidebar: XDG places (Home/Desktop/Documents/…), real block-device mounts
   with USB/microSD detection, and a trash view with restore/empty
 - Quick preview pane for images and text files
+- Show/hide hidden files toggle (hidden by default)
 - In-folder search, with an optional recursive (subfolder) mode
 - Material Design icons with an adjustable icon scale
 - CJK (Japanese/Chinese/Korean) filename rendering
@@ -30,7 +31,12 @@ and getting blurred.
 
 ## Installation
 
-No packaged releases yet — build from source (below).
+Grab the latest release from the
+[Releases page](https://github.com/krakerz/BrowDeck/releases), extract the
+`.tar.gz`, then run `./install.sh` (`./uninstall.sh` to remove it later) —
+see the bundled `INSTALL.txt`.
+
+Or build from source (below).
 
 ## Building from source
 
@@ -49,8 +55,8 @@ display's native resolution).
 
 ## Usage
 
-Navigate with the d-pad or left stick; the right stick scrolls the focused
-pane. Gamepad button reference:
+Navigate with the d-pad or left stick; the right stick moves the selection
+(or scrolls, in Preview) faster. Gamepad button reference:
 
 | Button    | Action                                    |
 |-----------|--------------------------------------------|
@@ -90,7 +96,9 @@ whose contents are the path to the
 checks that the binary it points to exists. If so, selecting an
 `.exe`/`.bat` file and opening the actions panel shows an "Add to
 IProLaunch" button, which runs that binary with
-`add <absolute path to the selected file>`.
+`add <absolute path to the selected file>`. If the file's already a
+registered library profile (checked via `library search`), the button
+shows a checkmark and is disabled instead.
 
 ---
 

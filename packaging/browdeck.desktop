@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=BrowDeck
+Comment=Gamepad-first file browser for Linux
+Exec=browdeck
+Icon=browdeck
+Categories=System;FileTools;FileManager;
+Terminal=false

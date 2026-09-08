@@ -1,0 +1,105 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "README.md"
+      - "CHANGELOG.md"
+      - "LICENSE"
+      - "INSTALL.txt"
+      - ".gitignore"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+      - name: Read version
+        id: version
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # A push that doesn't bump Cargo.toml's version re-uses an existing
+      # tag — build/test above already ran, stop here rather than fail on
+      # a duplicate tag or draft a release for nothing new.
+      - name: Check whether this version was already released
+        id: check
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            echo "is_new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build release binary
+        if: steps.check.outputs.is_new == 'true'
+        run: cargo build --release
+
+      - name: Build plain archive
+        if: steps.check.outputs.is_new == 'true'
+        run: |
+          set -euo pipefail
+          name="BrowDeck-${{ steps.version.outputs.version }}-x86_64"
+          mkdir "$name"
+          cp target/release/browdeck "$name/"
+          cp packaging/browdeck.desktop "$name/"
+          cp packaging/icon.png "$name/"
+          cp packaging/INSTALL.txt "$name/"
+          cp packaging/install.sh packaging/uninstall.sh "$name/"
+          chmod +x "$name/install.sh" "$name/uninstall.sh"
+          cp config/config.example.toml "$name/"
+          tar -czf "$name.tar.gz" "$name"
+          echo "ARCHIVE=$name.tar.gz" >> "$GITHUB_ENV"
+
+      # Pulls just the `## [<version>]` section out of CHANGELOG.md for the
+      # release body — matches the `## [<version>] — <date>` heading format
+      # this project's CHANGELOG.md uses, stopping at the next `## [`
+      # heading.
+      - name: Extract matching changelog section
+        if: steps.check.outputs.is_new == 'true'
+        run: |
+          set -euo pipefail
+          awk -v ver="${{ steps.version.outputs.version }}" '
+            $0 ~ "^## \\[" ver "\\]" { flag=1; next }
+            /^## \[/ { if (flag) exit }
+            flag { print }
+          ' CHANGELOG.md > release_notes.md
+          {
+            echo ""
+            echo "**Full changelog**: https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md"
+          } >> release_notes.md
+
+      - name: Create draft release
+        if: steps.check.outputs.is_new == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          body_path: release_notes.md
+          draft: true
+          files: ${{ env.ARCHIVE }}

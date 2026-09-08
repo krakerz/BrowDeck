@@ -1,0 +1,15 @@
+# BrowDeck configuration
+#
+# Copy to ~/.config/browdeck/config.toml (or $XDG_CONFIG_HOME/browdeck/config.toml
+# if set) and uncomment whatever you want to override. Every key is optional —
+# anything left out, or the whole file being absent, falls back to the default
+# shown here.
+
+# Launch fullscreen at the display's native resolution. This is the intended
+# mode for gamescope / Steam Game Mode. Set to false to launch in a resizable
+# window instead (useful for testing on a desktop).
+#fullscreen = true
+
+# Window size when fullscreen = false. Ignored while fullscreen = true.
+#width = 1280
+#height = 800
