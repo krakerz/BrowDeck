@@ -1,15 +1,15 @@
 use crate::{
-    deleted, fileicons, fileinfo, fileops, fonts, gamepad, iprolaunch, mounts, permissions, places,
-    preview,
+    custom_places, deleted, fileicons, fileinfo, fileops, fonts, gamepad, iprolaunch, mounts,
+    permissions, places, preview,
 };
 use egui_material_icons::MaterialIcon;
 use egui_material_icons::icons::{
-    ICON_ACCOUNT_TREE, ICON_ARROW_DOWNWARD, ICON_ARROW_UPWARD, ICON_CHECK_CIRCLE, ICON_CLOSE,
-    ICON_CONTENT_COPY, ICON_CONTENT_CUT, ICON_CONTENT_PASTE, ICON_CREATE_NEW_FOLDER, ICON_DELETE,
-    ICON_DELETE_SWEEP, ICON_DRIVE_FILE_RENAME_OUTLINE, ICON_GAMEPAD, ICON_LOCK, ICON_MENU,
-    ICON_OPEN_IN_NEW, ICON_PREVIEW, ICON_PRIORITY_HIGH, ICON_REFRESH, ICON_RESTORE_FROM_TRASH,
-    ICON_ROCKET_LAUNCH, ICON_SEARCH, ICON_SORT, ICON_UNARCHIVE, ICON_VISIBILITY,
-    ICON_VISIBILITY_OFF, ICON_ZOOM_IN, ICON_ZOOM_OUT,
+    ICON_ACCOUNT_TREE, ICON_ARROW_DOWNWARD, ICON_ARROW_UPWARD, ICON_BOOKMARK, ICON_CHECK_CIRCLE,
+    ICON_CLOSE, ICON_CONTENT_COPY, ICON_CONTENT_CUT, ICON_CONTENT_PASTE, ICON_CREATE_NEW_FOLDER,
+    ICON_DELETE, ICON_DELETE_SWEEP, ICON_DRIVE_FILE_RENAME_OUTLINE, ICON_GAMEPAD, ICON_KEEP,
+    ICON_KEEP_OFF, ICON_LOCK, ICON_MENU, ICON_OPEN_IN_NEW, ICON_PREVIEW, ICON_PRIORITY_HIGH,
+    ICON_REFRESH, ICON_RESTORE_FROM_TRASH, ICON_ROCKET_LAUNCH, ICON_SEARCH, ICON_SORT,
+    ICON_UNARCHIVE, ICON_VISIBILITY, ICON_VISIBILITY_OFF, ICON_ZOOM_IN, ICON_ZOOM_OUT,
 };
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -145,6 +145,11 @@ pub struct BrowDeckApp {
     trash_entries: Vec<deleted::TrashEntry>,
     selected_trash: Option<usize>,
     places: Vec<places::Place>,
+    /// User-pinned folders ("Pin"/"Unpin" in the Actions strip, folders
+    /// only) — shown in the sidebar right after `places` and before
+    /// Mounts. Persisted separately from `config.toml`; see
+    /// `custom_places`.
+    custom_places: Vec<PathBuf>,
     mounts: Vec<mounts::Mount>,
     selected: Option<PathBuf>,
     clipboard: Option<Clipboard>,
@@ -226,6 +231,11 @@ pub struct BrowDeckApp {
     /// in visual top-to-bottom order — confines d-pad/stick movement to
     /// the Sidebar pane.
     sidebar_ids: Vec<egui::Id>,
+    /// Same idea as `entry_ids`, for the sidebar's pinned-folder rows only
+    /// — lets the gamepad's ContextMenu button select a pinned folder
+    /// (for the Actions strip's Unpin badge) without navigating into it,
+    /// mirroring `select_focused_entry` for the file list.
+    sidebar_custom_place_ids: Vec<(egui::Id, PathBuf)>,
     /// Ids of last frame's toolbar buttons, in visual left-to-right order —
     /// confines d-pad/stick movement to the Toolbar pane.
     toolbar_ids: Vec<egui::Id>,
@@ -355,6 +365,7 @@ impl BrowDeckApp {
             trash_entries: Vec::new(),
             selected_trash: None,
             places: places::list_places(),
+            custom_places: custom_places::load(),
             mounts: mounts::list_mounts(),
             selected: None,
             clipboard: None,
@@ -390,6 +401,7 @@ impl BrowDeckApp {
             entry_ids: Vec::new(),
             trash_ids: Vec::new(),
             sidebar_ids: Vec::new(),
+            sidebar_custom_place_ids: Vec::new(),
             toolbar_ids: Vec::new(),
             right_focus_rows: Vec::new(),
             sidebar_last_focus: None,
@@ -1080,6 +1092,26 @@ impl BrowDeckApp {
         self.set_selected(Some(path));
     }
 
+    /// Gamepad ContextMenu while the Sidebar pane is focused — if the
+    /// focused row is a pinned folder (not a regular Place or Mount),
+    /// selects it without navigating into it, so the Actions strip's
+    /// Unpin badge has something to act on. Mirrors `select_focused_entry`
+    /// for the file list.
+    fn select_focused_sidebar_custom_place(&mut self, ctx: &egui::Context) {
+        let Some(id) = ctx.memory(|m| m.focused()) else {
+            return;
+        };
+        let Some(path) = self
+            .sidebar_custom_place_ids
+            .iter()
+            .find(|(eid, _)| *eid == id)
+            .map(|(_, p)| p.clone())
+        else {
+            return;
+        };
+        self.set_selected(Some(path));
+    }
+
     /// Whether a real gamepad is connected — gates the bottom legend bar.
     fn has_connected_pad(&self) -> bool {
         self.gamepad.as_ref().is_some_and(|g| g.has_connected_pad())
@@ -1626,6 +1658,9 @@ impl eframe::App for BrowDeckApp {
                         if !self.multi_select && matches!(self.view, View::Dir) {
                             self.select_focused_entry(ui.ctx());
                         }
+                        if focused_pane == Some(Pane::Sidebar) {
+                            self.select_focused_sidebar_custom_place(ui.ctx());
+                        }
                         if self.actions_available() {
                             self.context_menu_open = true;
                             self.focus_first_action = true;
@@ -2088,6 +2123,43 @@ impl BrowDeckApp {
                 clicked_place = Some(place.path.clone());
             }
         }
+        // User-pinned folders ("Pin"/"Unpin" in the Actions strip) —
+        // same row styling as the XDG places above, just a distinct icon
+        // so a hand-picked folder reads differently from the standard
+        // Home/Desktop/Downloads/… set. Deliberately no separate
+        // "Pinned"-style heading: the user asked for these to show up
+        // *as* Places, between Places and Mounts, not as their own
+        // section.
+        let mut sidebar_custom_place_ids = Vec::new();
+        let custom_places = self.custom_places.clone();
+        for custom in &custom_places {
+            let label = custom
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| custom.to_string_lossy().into_owned());
+            let r = ui.selectable_label(false, (self.icon_scaled(ICON_BOOKMARK), label.as_str()));
+            if self.scroll_to_focus == Some(r.id) {
+                r.scroll_to_me(Some(egui::Align::Center));
+                self.scroll_to_focus = None;
+            }
+            sidebar_ids.push(r.id);
+            sidebar_custom_place_ids.push((r.id, custom.clone()));
+            if r.clicked() {
+                clicked_place = Some(custom.clone());
+            }
+            // Right-click opens Actions on this pinned folder itself,
+            // without navigating into it — same idea as the file list's
+            // own secondary-click (see `select_focused_entry`), but only
+            // wired up for pinned folders since Unpin is the only sidebar-
+            // level action so far; regular Places/Mounts rows have
+            // nothing to act on without opening them.
+            if r.secondary_clicked() {
+                self.set_selected(Some(custom.clone()));
+                self.context_menu_open = true;
+                self.focus_first_action = true;
+            }
+        }
+        self.sidebar_custom_place_ids = sidebar_custom_place_ids;
 
         ui.add_space(8.0);
         ui.heading("Mounts");
@@ -2550,6 +2622,37 @@ impl BrowDeckApp {
                     self.focus_first_action = true;
                     // Deliberately left open: the rename/new-folder zone
                     // stacks below Actions rather than replacing it.
+                }
+            }
+            if let Some(path) = &single
+                && path.is_dir()
+            {
+                if custom_places::contains(&self.custom_places, path) {
+                    let r = Self::action_badge(
+                        self.badge_min_height(),
+                        ui,
+                        (self.icon(ICON_KEEP_OFF), "Unpin"),
+                    );
+                    first_id.get_or_insert(r.id);
+                    row_ids.push(r.id);
+                    if r.clicked() {
+                        let target = path.canonicalize().ok();
+                        self.custom_places
+                            .retain(|p| p.canonicalize().ok() != target);
+                        custom_places::save(&self.custom_places);
+                    }
+                } else {
+                    let r = Self::action_badge(
+                        self.badge_min_height(),
+                        ui,
+                        (self.icon(ICON_KEEP), "Pin"),
+                    );
+                    first_id.get_or_insert(r.id);
+                    row_ids.push(r.id);
+                    if r.clicked() {
+                        self.custom_places.push(path.clone());
+                        custom_places::save(&self.custom_places);
+                    }
                 }
             }
             if let Some(path) = &single

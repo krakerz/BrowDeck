@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod custom_places;
 mod deleted;
 mod fileicons;
 mod fileinfo;

@@ -1,5 +1,21 @@
 ## [Unreleased]
 
+## [1.6.0] — 2026-09-09
+
+### Added
+- "Pin"/"Unpin" toggle in the Actions strip for any selected folder —
+  pins it into the sidebar, shown right after Places and before Mounts;
+  the badge itself flips between Pin and Unpin depending on whether the
+  currently selected folder is already pinned. Persisted separately from
+  `config.toml` in `~/.config/browdeck/custom_places.toml` since this
+  list changes at runtime while `config.toml` is meant to stay
+  hand-edited. A pinned folder that's no longer a real directory
+  (deleted, or a symlink whose target isn't mounted) is silently dropped
+  on load instead of showing a Place that errors out when clicked
+- A pinned folder can also be unpinned directly from the sidebar itself
+  (right-click, or gamepad's context-menu button while it has focus) —
+  no need to navigate into it first just to reach its own Unpin badge
+
 ## [1.5.4] — 2026-09-09
 
 ### Fixed
