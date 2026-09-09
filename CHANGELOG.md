@@ -1,5 +1,13 @@
 ## [Unreleased]
 
+## [1.5.3] — 2026-09-09
+
+### Fixed
+- The sidebar's default (uncluttered) mount list didn't recognize
+  `/run/media/*` as a common location — udisks2's own auto-mount path,
+  what SteamOS itself uses for a USB drive/SD card — so it only showed
+  up behind "show all mounts"
+
 ## [1.5.2] — 2026-09-09
 
 ### Fixed
