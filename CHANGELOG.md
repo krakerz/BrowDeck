@@ -1,5 +1,13 @@
 ## [Unreleased]
 
+## [1.5.2] — 2026-09-09
+
+### Fixed
+- Steam library background image (`packaging/steam-library/`) had its
+  title text positioned too close to the left edge, getting cropped on
+  Steam Deck — recentered
+- Steam library logo image had the same off-center problem — recentered
+
 ## [1.5.1] — 2026-09-09
 
 ### Fixed
