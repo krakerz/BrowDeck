@@ -1,5 +1,17 @@
 ## [Unreleased]
 
+## [1.5.4] — 2026-09-09
+
+### Fixed
+- The toolbar's "Refresh" button only refreshed Mounts, not Places, so
+  a Place resolving through a mount that wasn't up yet at launch had no
+  way to reappear afterward
+- A Place (e.g. `~/Downloads`) could disappear from the sidebar
+  entirely if `~/.config/user-dirs.dirs` had it misconfigured to
+  resolve to `$HOME` itself, or didn't mention it at all — now falls
+  back to the conventional `$HOME/Downloads`-style path (symlinked or
+  not) in both cases, instead of only ever trusting that file as-is
+
 ## [1.5.3] — 2026-09-09
 
 ### Fixed

@@ -1738,8 +1738,16 @@ impl eframe::App for BrowDeckApp {
                 toolbar_ids.push(up.id);
                 let refresh_mounts = ui
                     .button(self.icon(ICON_REFRESH))
-                    .on_hover_text("Refresh mounts");
+                    .on_hover_text("Refresh places/mounts");
                 if refresh_mounts.clicked() {
+                    // Places, not just Mounts: a Place can resolve *through*
+                    // a mount (e.g. `~/Downloads` symlinked out to a drive)
+                    // — if that mount wasn't up yet at launch, the Place
+                    // silently never appeared, and this button's own old
+                    // "Refresh mounts"-only behavior could never bring it
+                    // back either. Refreshing both together avoids leaving
+                    // one stale while the other updates.
+                    self.places = places::list_places();
                     self.mounts = mounts::list_mounts();
                 }
                 toolbar_ids.push(refresh_mounts.id);
