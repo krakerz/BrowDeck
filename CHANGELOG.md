@@ -1,5 +1,48 @@
 ## [Unreleased]
 
+## [1.7.0] — 2026-09-09
+
+### Added
+- Compress the current selection to `.zip` or `.tar.gz` — a "Compress"
+  button in the Actions strip opens a row (like Permissions) with an
+  editable archive name (default "Archive") and the two format buttons
+- Extract now works on any number of selected archives at once, mixed
+  formats included, not just a single one
+
+### Changed
+- Paste, Copy, Cut, Compress, Extract, and Rename now consistently
+  close the whole Actions strip once they're done — New Folder and
+  Permissions' Apply consistently only close their own row, returning
+  to Actions
+- The Actions/Rename/Compress/Permissions rows no longer each repeat
+  their own copy of the selected file/folder name — it's shown once, in
+  a shared header above whichever row is open
+- Rename/New Folder, Compress, and Permissions are mutually exclusive —
+  opening one now closes whichever of the other two was already open,
+  instead of stacking all three at once with no clear way to back out
+- Each row's title ("Actions"/"Rename"/"New Folder"/"Compress"/
+  "Permissions") is now a fixed width, so the buttons after it line up
+  in the same column across rows
+- Removed the bottom status bar's own live "Multi-select: N selected"
+  text — redundant with the toolbar's own indicator
+
+### Fixed
+- A long filename in that header could push a row's own buttons off the
+  edge — now left-aligned with its own full-width row, ellipsized only
+  as a fallback
+- Gamepad A on any Actions-strip button (New Folder, Compress,
+  Permissions, …) silently did nothing while multi-select was active —
+  A was unconditionally reinterpreted as "toggle the focused file-list
+  row" whenever multi-select was on, even with focus actually on the
+  strip
+- After New Folder or Permissions' Apply/Cancel returned to Actions,
+  the strip stopped responding to d-pad navigation until pressing B —
+  neither one told Actions to re-claim focus for its own first badge
+- Opening the Actions strip could sometimes leave it completely dead to
+  d-pad input until closing and reopening it — its own focus-recovery
+  check could jump to a stale widget id left over from a previous,
+  already-closed session of the strip
+
 ## [1.6.0] — 2026-09-09
 
 ### Added

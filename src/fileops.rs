@@ -196,6 +196,178 @@ fn extract_tar_entries<R: Read>(
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CompressKind {
+    Zip,
+    TarGz,
+}
+
+pub fn spawn_compress(sources: Vec<PathBuf>, dest: PathBuf, kind: CompressKind) -> Job {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || run_compress(&sources, &dest, kind, &tx));
+    Job {
+        label: "Compressing".to_string(),
+        receiver: rx,
+        done: 0,
+        total: 1,
+        finished: false,
+        error: None,
+        finished_at: None,
+    }
+}
+
+fn run_compress(sources: &[PathBuf], dest: &Path, kind: CompressKind, tx: &Sender<ProgressMsg>) {
+    let result = match kind {
+        CompressKind::Zip => compress_zip(sources, dest, tx),
+        CompressKind::TarGz => compress_tar_gz(sources, dest, tx),
+    };
+    match result {
+        Ok(()) => {
+            let _ = tx.send(ProgressMsg::Done);
+        }
+        Err(e) => {
+            let _ = tx.send(ProgressMsg::Error(e));
+        }
+    }
+}
+
+/// One increment per entry (file or directory) that `add_to_zip`/
+/// `add_to_tar` will write — mirrors the tar-extract "count first, then do
+/// the work" pattern already used above, since neither writer exposes a
+/// total up front.
+fn walk_count(path: &Path, count: &mut u64) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    *count += 1;
+    if meta.is_dir()
+        && let Ok(entries) = std::fs::read_dir(path)
+    {
+        for entry in entries.flatten() {
+            walk_count(&entry.path(), count);
+        }
+    }
+}
+
+fn compress_zip(sources: &[PathBuf], dest: &Path, tx: &Sender<ProgressMsg>) -> Result<(), String> {
+    let mut total = 0u64;
+    for src in sources {
+        walk_count(src, &mut total);
+    }
+    let total = total.max(1);
+    let _ = tx.send(ProgressMsg::Progress { done: 0, total });
+
+    let file = std::fs::File::create(dest).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default();
+    let mut done = 0u64;
+    for src in sources {
+        let Some(name) = src.file_name() else {
+            continue;
+        };
+        add_to_zip(
+            &mut zip,
+            src,
+            Path::new(name),
+            options,
+            &mut done,
+            total,
+            tx,
+        )?;
+    }
+    zip.finish().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn add_to_zip(
+    zip: &mut zip::ZipWriter<std::fs::File>,
+    src: &Path,
+    rel_name: &Path,
+    options: zip::write::SimpleFileOptions,
+    done: &mut u64,
+    total: u64,
+    tx: &Sender<ProgressMsg>,
+) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(src).map_err(|e| e.to_string())?;
+    if meta.is_dir() {
+        zip.add_directory(format!("{}/", rel_name.to_string_lossy()), options)
+            .map_err(|e| e.to_string())?;
+        *done += 1;
+        let _ = tx.send(ProgressMsg::Progress { done: *done, total });
+        for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let child_rel = rel_name.join(entry.file_name());
+            add_to_zip(zip, &entry.path(), &child_rel, options, done, total, tx)?;
+        }
+    } else {
+        zip.start_file(rel_name.to_string_lossy(), options)
+            .map_err(|e| e.to_string())?;
+        let mut f = std::fs::File::open(src).map_err(|e| e.to_string())?;
+        std::io::copy(&mut f, zip).map_err(|e| e.to_string())?;
+        *done += 1;
+        let _ = tx.send(ProgressMsg::Progress { done: *done, total });
+    }
+    Ok(())
+}
+
+fn compress_tar_gz(
+    sources: &[PathBuf],
+    dest: &Path,
+    tx: &Sender<ProgressMsg>,
+) -> Result<(), String> {
+    let mut total = 0u64;
+    for src in sources {
+        walk_count(src, &mut total);
+    }
+    let total = total.max(1);
+    let _ = tx.send(ProgressMsg::Progress { done: 0, total });
+
+    let file = std::fs::File::create(dest).map_err(|e| e.to_string())?;
+    let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    let mut builder = tar::Builder::new(encoder);
+    let mut done = 0u64;
+    for src in sources {
+        let Some(name) = src.file_name() else {
+            continue;
+        };
+        add_to_tar(&mut builder, src, Path::new(name), &mut done, total, tx)?;
+    }
+    let encoder = builder.into_inner().map_err(|e| e.to_string())?;
+    encoder.finish().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn add_to_tar<W: Write>(
+    builder: &mut tar::Builder<W>,
+    src: &Path,
+    rel_name: &Path,
+    done: &mut u64,
+    total: u64,
+    tx: &Sender<ProgressMsg>,
+) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(src).map_err(|e| e.to_string())?;
+    if meta.is_dir() {
+        builder
+            .append_dir(rel_name, src)
+            .map_err(|e| e.to_string())?;
+        *done += 1;
+        let _ = tx.send(ProgressMsg::Progress { done: *done, total });
+        for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let child_rel = rel_name.join(entry.file_name());
+            add_to_tar(builder, &entry.path(), &child_rel, done, total, tx)?;
+        }
+    } else {
+        let mut f = std::fs::File::open(src).map_err(|e| e.to_string())?;
+        builder
+            .append_file(rel_name, &mut f)
+            .map_err(|e| e.to_string())?;
+        *done += 1;
+        let _ = tx.send(ProgressMsg::Progress { done: *done, total });
+    }
+    Ok(())
+}
+
 fn spawn_job(label: &str, sources: Vec<PathBuf>, dest_dir: PathBuf, is_move: bool) -> Job {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || run_job(&sources, &dest_dir, is_move, &tx));
@@ -480,6 +652,99 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dest_dir.join("nested/inside.txt")).unwrap(),
             "hello from tar.gz"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn compress_zip_round_trips_through_extract() {
+        let root = scratch_dir("compress_zip");
+        let src = root.join("src_dir");
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::write(src.join("a.txt"), b"hello").unwrap();
+        std::fs::write(src.join("nested/b.txt"), b"world").unwrap();
+
+        let archive_path = root.join("out.zip");
+        let job = spawn_compress(vec![src.clone()], archive_path.clone(), CompressKind::Zip);
+        let (done, total) = wait_done(&job.receiver).unwrap();
+        assert_eq!(done, total);
+
+        let dest_dir = root.join("dest");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let job = spawn_extract(archive_path, dest_dir.clone());
+        wait_done(&job.receiver).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dest_dir.join("src_dir/a.txt")).unwrap(),
+            "hello"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest_dir.join("src_dir/nested/b.txt")).unwrap(),
+            "world"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn compress_tar_gz_round_trips_through_extract() {
+        let root = scratch_dir("compress_targz");
+        let src = root.join("src_dir");
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::write(src.join("a.txt"), b"hello").unwrap();
+        std::fs::write(src.join("nested/b.txt"), b"world").unwrap();
+
+        let archive_path = root.join("out.tar.gz");
+        let job = spawn_compress(vec![src.clone()], archive_path.clone(), CompressKind::TarGz);
+        let (done, total) = wait_done(&job.receiver).unwrap();
+        assert_eq!(done, total);
+
+        let dest_dir = root.join("dest");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let job = spawn_extract(archive_path, dest_dir.clone());
+        wait_done(&job.receiver).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dest_dir.join("src_dir/a.txt")).unwrap(),
+            "hello"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest_dir.join("src_dir/nested/b.txt")).unwrap(),
+            "world"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn compress_zip_with_multiple_sources_keeps_each_as_its_own_top_level_entry() {
+        let root = scratch_dir("compress_zip_multi");
+        let file_a = root.join("a.txt");
+        let file_b = root.join("b.txt");
+        std::fs::write(&file_a, b"hello").unwrap();
+        std::fs::write(&file_b, b"world").unwrap();
+
+        let archive_path = root.join("out.zip");
+        let job = spawn_compress(
+            vec![file_a, file_b],
+            archive_path.clone(),
+            CompressKind::Zip,
+        );
+        wait_done(&job.receiver).unwrap();
+
+        let dest_dir = root.join("dest");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let job = spawn_extract(archive_path, dest_dir.clone());
+        wait_done(&job.receiver).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dest_dir.join("a.txt")).unwrap(),
+            "hello"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest_dir.join("b.txt")).unwrap(),
+            "world"
         );
 
         std::fs::remove_dir_all(&root).unwrap();

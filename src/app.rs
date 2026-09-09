@@ -4,12 +4,13 @@ use crate::{
 };
 use egui_material_icons::MaterialIcon;
 use egui_material_icons::icons::{
-    ICON_ACCOUNT_TREE, ICON_ARROW_DOWNWARD, ICON_ARROW_UPWARD, ICON_BOOKMARK, ICON_CHECK_CIRCLE,
-    ICON_CLOSE, ICON_CONTENT_COPY, ICON_CONTENT_CUT, ICON_CONTENT_PASTE, ICON_CREATE_NEW_FOLDER,
-    ICON_DELETE, ICON_DELETE_SWEEP, ICON_DRIVE_FILE_RENAME_OUTLINE, ICON_GAMEPAD, ICON_KEEP,
-    ICON_KEEP_OFF, ICON_LOCK, ICON_MENU, ICON_OPEN_IN_NEW, ICON_PREVIEW, ICON_PRIORITY_HIGH,
-    ICON_REFRESH, ICON_RESTORE_FROM_TRASH, ICON_ROCKET_LAUNCH, ICON_SEARCH, ICON_SORT,
-    ICON_UNARCHIVE, ICON_VISIBILITY, ICON_VISIBILITY_OFF, ICON_ZOOM_IN, ICON_ZOOM_OUT,
+    ICON_ACCOUNT_TREE, ICON_ARCHIVE, ICON_ARROW_DOWNWARD, ICON_ARROW_UPWARD, ICON_BOOKMARK,
+    ICON_CHECK_CIRCLE, ICON_CLOSE, ICON_CONTENT_COPY, ICON_CONTENT_CUT, ICON_CONTENT_PASTE,
+    ICON_CREATE_NEW_FOLDER, ICON_DELETE, ICON_DELETE_SWEEP, ICON_DRIVE_FILE_RENAME_OUTLINE,
+    ICON_FOLDER_ZIP, ICON_GAMEPAD, ICON_KEEP, ICON_KEEP_OFF, ICON_LOCK, ICON_MENU,
+    ICON_OPEN_IN_NEW, ICON_PREVIEW, ICON_PRIORITY_HIGH, ICON_REFRESH, ICON_RESTORE_FROM_TRASH,
+    ICON_ROCKET_LAUNCH, ICON_SEARCH, ICON_SORT, ICON_UNARCHIVE, ICON_VISIBILITY,
+    ICON_VISIBILITY_OFF, ICON_ZOOM_IN, ICON_ZOOM_OUT,
 };
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -117,6 +118,16 @@ struct RenameEditor {
     text: String,
 }
 
+struct CompressEditor {
+    /// One file, or every path in a multi-selection — either format
+    /// badge bundles all of them into a single archive.
+    paths: Vec<PathBuf>,
+    /// Editable target name (no extension — the chosen format badge
+    /// appends `.zip`/`.tar.gz`), defaulting to "Archive" regardless of
+    /// selection, same default-name convention as New Folder.
+    name: String,
+}
+
 enum View {
     Dir,
     Trash,
@@ -177,6 +188,7 @@ pub struct BrowDeckApp {
     context_menu_open: bool,
     perm_editor: Option<PermEditor>,
     rename_editor: Option<RenameEditor>,
+    compress_editor: Option<CompressEditor>,
     /// True while the Rename/New Folder name field has *real* keyboard
     /// focus (not just d-pad selection) — while set, the field renders as
     /// an actual `TextEdit` and gamepad d-pad/left-stick input is
@@ -192,6 +204,10 @@ pub struct BrowDeckApp {
     /// runs. Deliberately separate from `focus_first_action` — see
     /// `show_rename_editor`'s local `focus_pending` doc comment for why.
     rename_focus_pending: bool,
+    /// Same idea as `rename_editing`/`rename_focus_pending`, for the
+    /// Compress row's name field.
+    compress_editing: bool,
+    compress_focus_pending: bool,
     search_query: String,
     search_open: bool,
     /// One-shot flags consumed the next time the relevant widget is drawn.
@@ -382,8 +398,11 @@ impl BrowDeckApp {
             context_menu_open: false,
             perm_editor: None,
             rename_editor: None,
+            compress_editor: None,
             rename_editing: false,
             rename_focus_pending: false,
+            compress_editing: false,
+            compress_focus_pending: false,
             search_query: String::new(),
             search_open: false,
             focus_search: false,
@@ -673,7 +692,10 @@ impl BrowDeckApp {
             // re-prime so it lands somewhere real again next frame,
             // same as every other zone-closes-but-another-stays-open
             // transition below.
-            if self.context_menu_open || self.rename_editor.is_some() || self.perm_editor.is_some()
+            if self.context_menu_open
+                || self.rename_editor.is_some()
+                || self.perm_editor.is_some()
+                || self.compress_editor.is_some()
             {
                 self.focus_first_action = true;
             }
@@ -688,6 +710,15 @@ impl BrowDeckApp {
             // in the gamepad dispatch loop, and only exits edit mode.)
             self.rename_editor = None;
             self.rename_editing = false;
+            if self.context_menu_open {
+                self.focus_first_action = true;
+            }
+        } else if self.compress_editor.is_some() {
+            // Same reasoning as Rename/Permissions — Compress also opens
+            // *from* Actions. (Only reachable while not mid-edit — see
+            // `rename_editor`'s branch above for why.)
+            self.compress_editor = None;
+            self.compress_editing = false;
             if self.context_menu_open {
                 self.focus_first_action = true;
             }
@@ -801,12 +832,27 @@ impl BrowDeckApp {
         let guard_active = self.context_menu_open
             || self.perm_editor.is_some()
             || self.rename_editor.is_some()
+            || self.compress_editor.is_some()
             || self.quit_confirm;
-        if guard_active
-            && !self.focus_inside_strip(ctx)
-            && let Some(id) = self.right_last_focus
-        {
-            self.set_focus(ctx, id);
+        if guard_active && !self.focus_inside_strip(ctx) {
+            // Re-primes the same "focus this row's own first widget next
+            // render" flag every other opening path already uses, rather
+            // than jumping straight to `right_last_focus` — that field
+            // can be stale (left over from a *previous* strip session
+            // with a different badge set entirely, e.g. after closing
+            // Actions on one selection and reopening it on another) and,
+            // unlike `focus_pane`'s own use of the same field, was never
+            // validated with `ctx.read_response(id)` here. A stale id
+            // still gets accepted by `memory.request_focus`, but no
+            // widget ever claims it — so `move_focus_confined`'s
+            // `right_focus_rows` lookup for it always misses, and d-pad
+            // input on the strip goes fully dead until a manual B-and-
+            // reopen (reported by the user: "sometimes... can't interact
+            // with the action strip at all, but when i B and reopen it
+            // again, it's fixed"). `focus_first_action` instead lets
+            // whichever zone is actually showing this frame claim a
+            // guaranteed-fresh id for itself.
+            self.focus_first_action = true;
         }
     }
 
@@ -832,6 +878,7 @@ impl BrowDeckApp {
         let guard_active = self.context_menu_open
             || self.perm_editor.is_some()
             || self.rename_editor.is_some()
+            || self.compress_editor.is_some()
             || self.quit_confirm;
         if guard_active {
             let inside = self.focus_inside_strip(ctx);
@@ -978,6 +1025,7 @@ impl BrowDeckApp {
         if self.context_menu_open
             || self.perm_editor.is_some()
             || self.rename_editor.is_some()
+            || self.compress_editor.is_some()
             || self.quit_confirm
         {
             return;
@@ -1194,6 +1242,56 @@ impl BrowDeckApp {
         BASE_ICON_SIZE + 8.0
     }
 
+    /// Shared "the file/folder this row acts on" header, shown once above
+    /// whichever of Actions/Rename/Compress/Permissions is open, instead
+    /// of each repeating its own copy of the same name (reported by the
+    /// user against a screenshot with three identical copies of one
+    /// filename, one per open row). Its own row, full width, so unlike
+    /// those per-row copies it needs `.truncate()` only as a fallback for
+    /// an extreme case, not a routine necessity.
+    fn show_selection_header(&self, ui: &mut egui::Ui) {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            return;
+        }
+        if let [path] = paths.as_slice() {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string_lossy().into_owned());
+            ui.add(egui::Label::new(egui::RichText::new(&name).weak()).truncate())
+                .on_hover_text(path.to_string_lossy());
+        } else {
+            ui.add(
+                egui::Label::new(egui::RichText::new(format!("{} items", paths.len())).weak())
+                    .truncate(),
+            );
+        }
+        ui.add_space(2.0);
+    }
+
+    /// Fixed-width title for the Actions/Rename/Compress/Permissions rows
+    /// ("Actions", "Rename"/"New Folder", "Compress", "Permissions") —
+    /// sized to fit "Permissions", the longest of the four, so the
+    /// separator right after it (and everything in the row past that)
+    /// lines up at the same column regardless of which row is showing.
+    fn zone_title(&self, ui: &mut egui::Ui, text: &str) {
+        let font_id = egui::TextStyle::Body.resolve(ui.style());
+        let width = ui
+            .painter()
+            .layout_no_wrap(
+                "Permissions".to_string(),
+                font_id,
+                egui::Color32::PLACEHOLDER,
+            )
+            .size()
+            .x;
+        ui.add_sized(
+            [width, self.badge_min_height()],
+            egui::Label::new(egui::RichText::new(text).strong()),
+        );
+    }
+
     /// A compact, clickable button styled like the bottom bar's badges
     /// (small, rounded, gray) instead of a full-size default `Button` —
     /// used throughout the Actions/Permissions/Progress strip so it reads
@@ -1331,7 +1429,10 @@ impl BrowDeckApp {
             self.quit_confirm = false;
             // Same re-priming as the `escape()` path for this — see its
             // comment.
-            if self.context_menu_open || self.rename_editor.is_some() || self.perm_editor.is_some()
+            if self.context_menu_open
+                || self.rename_editor.is_some()
+                || self.perm_editor.is_some()
+                || self.compress_editor.is_some()
             {
                 self.focus_first_action = true;
             }
@@ -1412,13 +1513,6 @@ impl BrowDeckApp {
             ui.label("Quit");
             Self::key_badge(ui, "Select");
             ui.label("Preview width");
-            if self.multi_select {
-                ui.separator();
-                ui.colored_label(
-                    egui::Color32::from_rgb(100, 150, 255),
-                    format!("Multi-select: {} selected", self.multi_selected.len()),
-                );
-            }
         });
     }
 
@@ -1613,6 +1707,15 @@ impl eframe::App for BrowDeckApp {
                     }
                     continue;
                 }
+                // Same reasoning as `rename_editing` above, for the
+                // Compress row's name field.
+                if self.compress_editing {
+                    if matches!(action, gamepad::Action::Back) {
+                        self.compress_editing = false;
+                        self.compress_focus_pending = true;
+                    }
+                    continue;
+                }
                 match action {
                     gamepad::Action::Quit => {
                         self.quit_confirm = true;
@@ -1631,7 +1734,21 @@ impl eframe::App for BrowDeckApp {
                         self.move_focus_confined(ui.ctx(), dir);
                     }
                     gamepad::Action::Activate => {
-                        if self.multi_select && matches!(self.view, View::Dir) {
+                        // Multi-select's own toggle-the-focused-row meaning
+                        // only applies while focus is actually on the file
+                        // list (`Pane::Active`) — without that check, A
+                        // while multi-select was on always tried to toggle
+                        // whatever `entry_ids` id happened to have focus,
+                        // even when focus was really on an Actions-strip
+                        // badge (New Folder/Compress/Permissions/…), which
+                        // isn't in `entry_ids` at all — so it silently
+                        // found nothing and did nothing, instead of
+                        // activating the badge like it does outside
+                        // multi-select.
+                        if self.multi_select
+                            && matches!(self.view, View::Dir)
+                            && focused_pane == Some(Pane::Active)
+                        {
                             self.toggle_focused_entry(ui.ctx());
                         } else {
                             ui.ctx().input_mut(|i| {
@@ -1923,20 +2040,28 @@ impl eframe::App for BrowDeckApp {
         let preview_visible = self.preview_visible();
         let show_actions = self.context_menu_open;
         let show_rename = self.rename_editor.is_some();
+        let show_compress = self.compress_editor.is_some();
         let show_permissions = self.perm_editor.is_some();
         let show_progress = !self.jobs.is_empty();
+        // Whichever of Rename/Compress/Permissions is open (never more
+        // than one — see `close_sub_editors`) shares one header above it
+        // instead of repeating "the file/folder this row acts on" itself
+        // — only meaningful while Actions itself is actually showing,
+        // and not while Quit has taken over the strip.
+        let show_header = show_actions && !self.quit_confirm;
 
-        // Actions/Rename/Permissions/Progress are a horizontal strip
-        // along the very bottom, above the status bar, spanning from the
-        // sidebar/main-pane border to the window's right edge (drawn
-        // *after* the sidebar so it naturally excludes that width, and
-        // *before* the right/central panels so they get whatever's left
-        // above it) — not part of the Preview pane. Rows stack in fixed
-        // priority order (Actions, Rename, Permissions, Progress),
-        // skipping whichever aren't active.
+        // Actions/Rename/Compress/Permissions/Progress are a horizontal
+        // strip along the very bottom, above the status bar, spanning
+        // from the sidebar/main-pane border to the window's right edge
+        // (drawn *after* the sidebar so it naturally excludes that
+        // width, and *before* the right/central panels so they get
+        // whatever's left above it) — not part of the Preview pane.
+        // Rows stack in fixed priority order (Actions, Rename, Compress,
+        // Permissions, Progress), skipping whichever aren't active.
         enum FooterZone {
             Actions,
             Rename,
+            Compress,
             Permissions,
             Progress,
             Quit,
@@ -1953,6 +2078,9 @@ impl eframe::App for BrowDeckApp {
             }
             if show_rename {
                 active_zones.push(FooterZone::Rename);
+            }
+            if show_compress {
+                active_zones.push(FooterZone::Compress);
             }
             if show_permissions {
                 active_zones.push(FooterZone::Permissions);
@@ -2045,10 +2173,14 @@ impl eframe::App for BrowDeckApp {
                             // sat flush against the strip's own top border,
                             // reading as too tight.
                             ui.add_space(2.0);
+                            if show_header {
+                                self.show_selection_header(ui);
+                            }
                             for zone in &active_zones {
                                 match zone {
                                     FooterZone::Actions => self.show_actions_zone(ui),
                                     FooterZone::Rename => self.show_rename_editor(ui),
+                                    FooterZone::Compress => self.show_compress_editor(ui),
                                     FooterZone::Permissions => self.show_permission_editor(ui),
                                     FooterZone::Progress => self.show_progress_zone(ui),
                                     FooterZone::Quit => self.show_quit_zone(ui),
@@ -2534,6 +2666,21 @@ impl BrowDeckApp {
         }
     }
 
+    /// Rename/New Folder, Compress, and Permissions each open *from*
+    /// Actions and each opens its own stacked strip row — call this
+    /// right before setting whichever one so at most one is ever open at
+    /// once. Without it, opening all three in sequence (all reachable
+    /// without ever closing the last one) left three rows stacked
+    /// simultaneously with no way to tell which B press would close
+    /// which — reported by the user reproducing exactly that.
+    fn close_sub_editors(&mut self) {
+        self.rename_editor = None;
+        self.rename_editing = false;
+        self.compress_editor = None;
+        self.compress_editing = false;
+        self.perm_editor = None;
+    }
+
     /// Flat, button-driven actions panel — not a mouse-style hover/right-click
     /// popup, so every action is a normal focusable/gamepad-activatable
     /// button (see NOTES.md on why: Dolphin's nested right-click menu under
@@ -2553,6 +2700,16 @@ impl BrowDeckApp {
     fn show_dir_actions(&mut self, ui: &mut egui::Ui) {
         let paths = self.selected_paths();
         let single = (paths.len() == 1).then(|| paths[0].clone());
+        // Extract works on any number of selected archives at once,
+        // mixed formats included — each is its own independent job
+        // (`archive_kind` dispatches per-file), so a non-archive mixed
+        // into a multi-selection is just skipped rather than blocking
+        // the ones that do qualify.
+        let archive_paths: Vec<PathBuf> = paths
+            .iter()
+            .filter(|p| fileops::is_archive(p))
+            .cloned()
+            .collect();
         let mut first_id = None;
         let mut row_ids: Vec<egui::Id> = Vec::new();
         ui.horizontal_wrapped(|ui| {
@@ -2561,16 +2718,7 @@ impl BrowDeckApp {
             if close.clicked() {
                 self.context_menu_open = false;
             }
-            ui.strong("Actions");
-            if let Some(path) = &single {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.to_string_lossy().into_owned());
-                ui.weak(name).on_hover_text(path.to_string_lossy());
-            } else if paths.len() > 1 {
-                ui.weak(format!("{} items", paths.len()));
-            }
+            self.zone_title(ui, "Actions");
             ui.separator();
             if self.clipboard.is_some() && self.jobs.is_empty() {
                 let r = Self::action_badge(
@@ -2582,8 +2730,7 @@ impl BrowDeckApp {
                 row_ids.push(r.id);
                 if r.clicked() {
                     self.paste();
-                    // Deliberately left open: the copy/move progress zone
-                    // stacks below Actions rather than replacing it.
+                    self.context_menu_open = false;
                 }
             }
             let r = Self::action_badge(
@@ -2594,6 +2741,7 @@ impl BrowDeckApp {
             first_id.get_or_insert(r.id);
             row_ids.push(r.id);
             if r.clicked() {
+                self.close_sub_editors();
                 self.rename_editor = Some(RenameEditor {
                     target: None,
                     text: "New Folder".to_string(),
@@ -2615,6 +2763,7 @@ impl BrowDeckApp {
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                    self.close_sub_editors();
                     self.rename_editor = Some(RenameEditor {
                         target: Some(path.clone()),
                         text: name,
@@ -2711,10 +2860,7 @@ impl BrowDeckApp {
                     self.context_menu_open = false;
                 }
             }
-            if let Some(path) = &single
-                && fileops::is_archive(path)
-                && self.jobs.is_empty()
-            {
+            if !archive_paths.is_empty() && self.jobs.is_empty() {
                 let r = Self::action_badge(
                     self.badge_min_height(),
                     ui,
@@ -2724,10 +2870,31 @@ impl BrowDeckApp {
                 row_ids.push(r.id);
                 if r.clicked() {
                     let dest_dir = self.current_dir.clone();
-                    self.jobs
-                        .push(fileops::spawn_extract(path.clone(), dest_dir));
-                    // Deliberately left open: the extract progress zone
-                    // stacks below Actions rather than replacing it.
+                    for path in &archive_paths {
+                        self.jobs
+                            .push(fileops::spawn_extract(path.clone(), dest_dir.clone()));
+                    }
+                    self.context_menu_open = false;
+                }
+            }
+            if !paths.is_empty() && self.jobs.is_empty() {
+                let r = Self::action_badge(
+                    self.badge_min_height(),
+                    ui,
+                    (self.icon(ICON_ARCHIVE), "Compress"),
+                );
+                first_id.get_or_insert(r.id);
+                row_ids.push(r.id);
+                if r.clicked() {
+                    self.close_sub_editors();
+                    self.compress_editor = Some(CompressEditor {
+                        paths: paths.clone(),
+                        name: "Archive".to_string(),
+                    });
+                    self.focus_first_action = true;
+                    // Deliberately left open: the compress row stacks
+                    // below Actions rather than replacing it, same as
+                    // Rename/Permissions.
                 }
             }
             if !paths.is_empty() {
@@ -2747,6 +2914,7 @@ impl BrowDeckApp {
                     if r.clicked()
                         && let Some(mode) = permissions::read_mode(&paths[0])
                     {
+                        self.close_sub_editors();
                         self.perm_editor = Some(PermEditor {
                             paths: paths.clone(),
                             mode,
@@ -2801,15 +2969,17 @@ impl BrowDeckApp {
             }
         });
         self.right_focus_rows.push(row_ids);
-        // Skip if Permissions/Rename was *just* opened by a click above:
-        // `active_zones` was computed once, before this render, so that
-        // new zone won't actually render (and consume `focus_first_action`
-        // itself) until next frame — if this check didn't defer to it,
-        // Actions' own `first_id` would steal the flag first, focusing
-        // the wrong badge instead of the new zone's own first widget.
+        // Skip if Permissions/Rename/Compress was *just* opened by a
+        // click above: `active_zones` was computed once, before this
+        // render, so that new zone won't actually render (and consume
+        // `focus_first_action` itself) until next frame — if this check
+        // didn't defer to it, Actions' own `first_id` would steal the
+        // flag first, focusing the wrong badge instead of the new
+        // zone's own first widget.
         if self.focus_first_action
             && self.perm_editor.is_none()
             && self.rename_editor.is_none()
+            && self.compress_editor.is_none()
             && let Some(id) = first_id
         {
             ui.ctx().memory_mut(|m| m.request_focus(id));
@@ -2921,11 +3091,14 @@ impl BrowDeckApp {
             if close.clicked() {
                 cancel = true;
             }
-            ui.strong(if is_new_folder {
-                "New Folder"
-            } else {
-                "Rename"
-            });
+            self.zone_title(
+                ui,
+                if is_new_folder {
+                    "New Folder"
+                } else {
+                    "Rename"
+                },
+            );
             ui.separator();
             if editing {
                 let text_resp = ui.add(
@@ -2993,6 +3166,9 @@ impl BrowDeckApp {
                         if self.selected.as_deref() == Some(old_path.as_path()) {
                             self.set_selected(Some(new_path));
                         }
+                        // Unlike New Folder, Rename closes all of Actions
+                        // — same "done, back to browsing" behavior as
+                        // Paste/Copy/Cut/Compress/Extract.
                         self.rename_editor = None;
                         self.context_menu_open = false;
                         self.refresh();
@@ -3003,15 +3179,26 @@ impl BrowDeckApp {
                     if let Err(e) = std::fs::create_dir(&new_dir) {
                         eprintln!("create folder failed: {e}");
                     } else {
+                        // Unlike Rename, New Folder only closes its own
+                        // row — Actions stays open, same as Permissions'
+                        // Apply. `focus_first_action` re-primes so Actions
+                        // claims focus for its own first badge next frame
+                        // instead of leaving it on this now-gone row's
+                        // widget (which otherwise left the strip looking
+                        // stale/unresponsive to d-pad input until B, the
+                        // one path that already re-primed this).
                         self.rename_editor = None;
-                        self.context_menu_open = false;
                         self.refresh();
                         self.set_selected(Some(new_dir));
+                        self.focus_first_action = true;
                     }
                 }
             }
         } else if cancel {
             self.rename_editor = None;
+            if self.context_menu_open {
+                self.focus_first_action = true;
+            }
         }
         // Covers every path above that can close the zone (apply success,
         // cancel) in one place, including a mouse click on Close/Cancel
@@ -3022,7 +3209,14 @@ impl BrowDeckApp {
         if self.rename_editor.is_none() {
             self.rename_editing = false;
         }
+        // Guarded on `rename_editor` still being open — Apply/Cancel
+        // above may have just closed it *and* re-primed
+        // `focus_first_action` for Actions to pick up next frame; without
+        // this guard, this same-frame check would immediately steal that
+        // back with `first_id`, a widget from the row that's about to
+        // stop rendering.
         if self.focus_first_action
+            && self.rename_editor.is_some()
             && let Some(id) = first_id
         {
             ui.ctx().memory_mut(|m| m.request_focus(id));
@@ -3046,16 +3240,7 @@ impl BrowDeckApp {
             if close.clicked() {
                 cancel = true;
             }
-            ui.strong("Permissions");
-            if let [path] = paths.as_slice() {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.to_string_lossy().into_owned());
-                ui.weak(name).on_hover_text(path.to_string_lossy());
-            } else {
-                ui.weak(format!("{} items", paths.len()));
-            }
+            self.zone_title(ui, "Permissions");
             ui.separator();
             for (row_label, shift) in [("Owner", 6), ("Group", 3), ("Other", 0)] {
                 ui.label(row_label);
@@ -3099,12 +3284,143 @@ impl BrowDeckApp {
             // permissions string from before Apply.
             self.selected_info = None;
             self.perm_editor = None;
+            // Re-primes focus onto Actions' own first badge next frame —
+            // see the matching comment in `show_rename_editor`'s New
+            // Folder branch for why this is needed (without it the strip
+            // looked stale/dead to d-pad input until pressing B).
+            if self.context_menu_open {
+                self.focus_first_action = true;
+            }
         } else if cancel {
             self.perm_editor = None;
+            if self.context_menu_open {
+                self.focus_first_action = true;
+            }
         } else {
             self.perm_editor.as_mut().unwrap().mode = mode;
         }
+        // Guarded on `perm_editor` still being open — see the matching
+        // comment in `show_rename_editor`.
         if self.focus_first_action
+            && self.perm_editor.is_some()
+            && let Some(id) = first_id
+        {
+            ui.ctx().memory_mut(|m| m.request_focus(id));
+            self.focus_first_action = false;
+        }
+    }
+
+    fn show_compress_editor(&mut self, ui: &mut egui::Ui) {
+        let Some(editor) = &self.compress_editor else {
+            return;
+        };
+        let paths = editor.paths.clone();
+        let mut text = editor.name.clone();
+        let editing = self.compress_editing;
+        let focus_pending = self.compress_focus_pending;
+        let mut compress_as = None;
+        let mut cancel = false;
+        let mut first_id = None;
+        let mut field_id = None;
+        let mut row_ids: Vec<egui::Id> = Vec::new();
+        ui.horizontal_wrapped(|ui| {
+            let close = Self::action_badge(self.badge_min_height(), ui, self.icon(ICON_CLOSE));
+            row_ids.push(close.id);
+            if close.clicked() {
+                cancel = true;
+            }
+            self.zone_title(ui, "Compress");
+            ui.separator();
+            // Two-stage name field, same as Rename/New Folder: a plain
+            // navigable badge until clicked (or A), only then a real
+            // `TextEdit` — see `show_rename_editor`'s doc comment for why
+            // auto-focusing a real text field the instant this row opens
+            // would steal the very next d-pad press as a cursor move
+            // instead of navigation.
+            if editing {
+                let text_resp = ui.add(
+                    egui::TextEdit::singleline(&mut text)
+                        .hint_text("Name")
+                        .desired_width(220.0),
+                );
+                field_id = Some(text_resp.id);
+                row_ids.push(text_resp.id);
+            } else {
+                let label = if text.is_empty() {
+                    "Archive".to_string()
+                } else {
+                    text.clone()
+                };
+                let field = Self::action_badge(self.badge_min_height(), ui, label)
+                    .on_hover_text("Press A (or click) to edit the name");
+                first_id.get_or_insert(field.id);
+                field_id = Some(field.id);
+                row_ids.push(field.id);
+                if field.clicked() {
+                    self.compress_editing = true;
+                    self.compress_focus_pending = true;
+                }
+            }
+            ui.separator();
+            let zip_btn = Self::action_badge(
+                self.badge_min_height(),
+                ui,
+                (self.icon(ICON_FOLDER_ZIP), "Compress (.zip)"),
+            );
+            row_ids.push(zip_btn.id);
+            if zip_btn.clicked() {
+                compress_as = Some(fileops::CompressKind::Zip);
+            }
+            let targz_btn = Self::action_badge(
+                self.badge_min_height(),
+                ui,
+                (self.icon(ICON_ARCHIVE), "Compress (.tar.gz)"),
+            );
+            row_ids.push(targz_btn.id);
+            if targz_btn.clicked() {
+                compress_as = Some(fileops::CompressKind::TarGz);
+            }
+            let cancel_btn = Self::action_badge(self.badge_min_height(), ui, "Cancel");
+            row_ids.push(cancel_btn.id);
+            if cancel_btn.clicked() {
+                cancel = true;
+            }
+        });
+        self.right_focus_rows.push(row_ids);
+        if focus_pending && let Some(id) = field_id {
+            self.set_focus(ui.ctx(), id);
+            self.compress_focus_pending = false;
+        }
+        let trimmed = text.trim().to_string();
+        if let Some(editor) = &mut self.compress_editor {
+            editor.name = text;
+        }
+        if let Some(kind) = compress_as {
+            if trimmed.is_empty() {
+                eprintln!("name can't be empty");
+            } else {
+                let ext = match kind {
+                    fileops::CompressKind::Zip => "zip",
+                    fileops::CompressKind::TarGz => "tar.gz",
+                };
+                let dest = self.current_dir.join(format!("{trimmed}.{ext}"));
+                self.jobs.push(fileops::spawn_compress(paths, dest, kind));
+                self.compress_editor = None;
+                self.context_menu_open = false;
+            }
+        } else if cancel {
+            self.compress_editor = None;
+            if self.context_menu_open {
+                self.focus_first_action = true;
+            }
+        }
+        if self.compress_editor.is_none() {
+            self.compress_editing = false;
+        }
+        // Guarded on `compress_editor` still being open — see the
+        // matching comment in `show_rename_editor`.
+        if self.focus_first_action
+            && self.compress_editor.is_some()
             && let Some(id) = first_id
         {
             ui.ctx().memory_mut(|m| m.request_focus(id));
