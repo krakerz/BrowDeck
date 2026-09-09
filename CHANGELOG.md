@@ -1,5 +1,19 @@
 ## [Unreleased]
 
+## [1.5.1] — 2026-09-09
+
+### Fixed
+- The sidebar info card kept showing the old permissions string after
+  applying a permission change — it caches per-selection and chmod
+  doesn't change the selection, so nothing told it to recompute
+
+## [1.5.0] — 2026-09-09
+
+### Added
+- The Permissions action greys out (with a tooltip) instead of opening
+  when you don't own the selected file(s) and aren't root — changing
+  permissions would just fail otherwise
+
 ## [1.4.0] — 2026-09-08
 
 ### Changed

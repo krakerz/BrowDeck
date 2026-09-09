@@ -2620,28 +2620,44 @@ impl BrowDeckApp {
                 }
             }
             if !paths.is_empty() {
-                let r = Self::action_badge(
-                    self.badge_min_height(),
-                    ui,
-                    (self.icon(ICON_LOCK), "Permissions"),
-                );
-                first_id.get_or_insert(r.id);
-                row_ids.push(r.id);
-                // Multi-selection: applies one mode to every selected
-                // path on Apply. Initial checkbox state comes from just
-                // the first path — they may not all start out the same,
-                // but Apply always sets the same mode on all of them
-                // regardless of what each one started as.
-                if r.clicked()
-                    && let Some(mode) = permissions::read_mode(&paths[0])
-                {
-                    self.perm_editor = Some(PermEditor {
-                        paths: paths.clone(),
-                        mode,
-                    });
-                    self.focus_first_action = true;
-                    // Deliberately left open: the permission editor stacks
-                    // below Actions rather than replacing it.
+                if permissions::can_chmod(&paths) {
+                    let r = Self::action_badge(
+                        self.badge_min_height(),
+                        ui,
+                        (self.icon(ICON_LOCK), "Permissions"),
+                    );
+                    first_id.get_or_insert(r.id);
+                    row_ids.push(r.id);
+                    // Multi-selection: applies one mode to every selected
+                    // path on Apply. Initial checkbox state comes from just
+                    // the first path — they may not all start out the same,
+                    // but Apply always sets the same mode on all of them
+                    // regardless of what each one started as.
+                    if r.clicked()
+                        && let Some(mode) = permissions::read_mode(&paths[0])
+                    {
+                        self.perm_editor = Some(PermEditor {
+                            paths: paths.clone(),
+                            mode,
+                        });
+                        self.focus_first_action = true;
+                        // Deliberately left open: the permission editor
+                        // stacks below Actions rather than replacing it.
+                    }
+                } else {
+                    // Not the owner of (at least) one selected path, and
+                    // not root — `chmod` would just fail with `EPERM`.
+                    // Not pushed into `row_ids`/`first_id`: a disabled
+                    // badge surrenders focus the instant egui draws it
+                    // (see NOTES.md "toolbar teleport at min/max zoom"),
+                    // so landing d-pad navigation on it snaps back to the
+                    // first badge instead of stepping past it.
+                    Self::action_badge_disabled(
+                        self.badge_min_height(),
+                        ui,
+                        (self.icon(ICON_LOCK), "Permissions"),
+                    )
+                    .on_hover_text("Requires root to change");
                 }
             }
             if let Some(path) = &single
@@ -2966,6 +2982,11 @@ impl BrowDeckApp {
                     eprintln!("chmod failed for {}: {e}", path.display());
                 }
             }
+            // Sidebar info card caches its `FileInfo` per-path and only
+            // recomputes when the *selection* changes — chmod doesn't
+            // change the selection, so without this it kept showing the
+            // permissions string from before Apply.
+            self.selected_info = None;
             self.perm_editor = None;
         } else if cancel {
             self.perm_editor = None;
