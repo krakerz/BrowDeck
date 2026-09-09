@@ -20,11 +20,15 @@ impl Mount {
     }
 
     /// Whether this is one of the conventional removable-media mount
-    /// locations (`/media/*`, `/mnt/*`) — the default, uncluttered sidebar
-    /// view shows only these; internal system mounts (`/`, `/var/log`, …)
-    /// are opt-in via "show all".
+    /// locations (`/media/*`, `/mnt/*`, `/run/media/*` — the last is
+    /// udisks2's auto-mount location, what SteamOS itself uses for a USB
+    /// drive/SD card inserted in Game/Desktop Mode) — the default,
+    /// uncluttered sidebar view shows only these; internal system mounts
+    /// (`/`, `/var/log`, …) are opt-in via "show all".
     pub fn is_common_location(&self) -> bool {
-        self.mount_point.starts_with("/media") || self.mount_point.starts_with("/mnt")
+        self.mount_point.starts_with("/media")
+            || self.mount_point.starts_with("/mnt")
+            || self.mount_point.starts_with("/run/media")
     }
 }
 
@@ -101,5 +105,32 @@ fn parent_block_device(name: &str) -> String {
         name.to_string()
     } else {
         trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mount(mount_point: &str) -> Mount {
+        Mount {
+            device: "/dev/sda1".to_string(),
+            mount_point: PathBuf::from(mount_point),
+            removable: true,
+        }
+    }
+
+    #[test]
+    fn common_locations_include_run_media_alongside_media_and_mnt() {
+        assert!(mount("/media/deck/MY_USB").is_common_location());
+        assert!(mount("/mnt/data").is_common_location());
+        assert!(mount("/run/media/deck/MY_USB").is_common_location());
+    }
+
+    #[test]
+    fn internal_system_mounts_are_not_common_locations() {
+        assert!(!mount("/").is_common_location());
+        assert!(!mount("/var/log").is_common_location());
+        assert!(!mount("/boot").is_common_location());
     }
 }
