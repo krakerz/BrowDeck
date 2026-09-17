@@ -1,6 +1,11 @@
 ## [Unreleased]
 
-## [1.9.1] — 2026-09-17
+## [1.10.0] — 2026-09-17
+
+### Added
+- Extracting a password-protected `.zip` or `.rar` now offers a password
+  prompt (with a Cancel) instead of just failing — enter the password
+  and it retries the same archive
 
 ### Fixed
 - Checking for an update and installing it showed no progress at all

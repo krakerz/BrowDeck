@@ -109,9 +109,10 @@ doesn't descend into symlinked directories, to avoid loops.
 shells out to it — RAR isn't a format it reads on its own, and the
 official library isn't something to bundle into a GPL project); the
 Extract button greys out with a tooltip if neither is found. Compressing
-*to* `.rar` isn't supported at all. Password-protected archives (`.zip`
-or `.rar`) aren't supported either way — extraction fails with a clear
-"password-protected" message rather than prompting for one.
+*to* `.rar` isn't supported at all. A password-protected `.zip` or
+`.rar` prompts for the password right in the Actions strip (with a
+Cancel) instead of just failing. `.tar`/`.tar.gz` have no
+password-protection concept at all — nothing to unlock there.
 
 **How does Check for Update work?**
 Manual only — nothing is checked automatically. R3 → Menu → Check for

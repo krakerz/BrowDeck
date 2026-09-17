@@ -129,6 +129,26 @@ struct CompressEditor {
     name: String,
 }
 
+/// Shown when an extraction (zip or rar) turns out to need a password —
+/// promoted from a finished `fileops::Job` in `self.jobs` (see the
+/// central polling in `ui()`) rather than opened directly from a click,
+/// since the failure only becomes known asynchronously after Extract
+/// has already been clicked (and, per this app's own close-behavior
+/// convention, Extract already closed Actions by then).
+struct PasswordPrompt {
+    retry: fileops::ExtractRetry,
+    password: String,
+    /// Set once a retry with the entered password also fails (wrong
+    /// password) or hits some other error — `None` on the very first
+    /// prompt for a given archive.
+    error: Option<String>,
+    /// The retry job in flight, if a password has been submitted —
+    /// polled independently of `self.jobs` (same reasoning as
+    /// `update_install`) so its outcome unambiguously belongs to this
+    /// specific prompt, not some other concurrently-extracting archive.
+    job: Option<fileops::Job>,
+}
+
 enum View {
     Dir,
     Trash,
@@ -209,6 +229,13 @@ pub struct BrowDeckApp {
     /// Compress row's name field.
     compress_editing: bool,
     compress_focus_pending: bool,
+    /// Set when a `.zip`/`.rar` extraction turns out to need a password
+    /// — see `PasswordPrompt`'s own doc comment.
+    password_prompt: Option<PasswordPrompt>,
+    /// Same idea as `rename_editing`/`rename_focus_pending`, for the
+    /// password prompt's own text field.
+    password_prompt_editing: bool,
+    password_prompt_focus_pending: bool,
     search_query: String,
     search_open: bool,
     /// One-shot flags consumed the next time the relevant widget is drawn.
@@ -432,6 +459,9 @@ impl BrowDeckApp {
             rename_focus_pending: false,
             compress_editing: false,
             compress_focus_pending: false,
+            password_prompt: None,
+            password_prompt_editing: false,
+            password_prompt_focus_pending: false,
             search_query: String::new(),
             search_open: false,
             focus_search: false,
@@ -751,6 +781,21 @@ impl BrowDeckApp {
             {
                 self.focus_first_action = true;
             }
+        } else if self.password_prompt.is_some() {
+            // Cancels the extraction outright — whatever was already
+            // written to disk before hitting the password-protected
+            // entry stays (same as any other mid-extraction failure;
+            // there's no rollback anywhere in this app), but no retry
+            // is attempted.
+            self.password_prompt = None;
+            self.password_prompt_editing = false;
+            if self.context_menu_open
+                || self.rename_editor.is_some()
+                || self.perm_editor.is_some()
+                || self.compress_editor.is_some()
+            {
+                self.focus_first_action = true;
+            }
         } else if self.multi_select {
             self.multi_select = false;
             self.multi_selected.clear();
@@ -888,6 +933,7 @@ impl BrowDeckApp {
             || self.menu_open
             || self.update_available.is_some()
             || self.update_ready.is_some()
+            || self.password_prompt.is_some()
             || self.quit_confirm;
         if guard_active && !self.focus_inside_strip(ctx) {
             // Re-primes the same "focus this row's own first widget next
@@ -937,6 +983,7 @@ impl BrowDeckApp {
             || self.menu_open
             || self.update_available.is_some()
             || self.update_ready.is_some()
+            || self.password_prompt.is_some()
             || self.quit_confirm;
         if guard_active {
             let inside = self.focus_inside_strip(ctx);
@@ -1087,6 +1134,7 @@ impl BrowDeckApp {
             || self.menu_open
             || self.update_available.is_some()
             || self.update_ready.is_some()
+            || self.password_prompt.is_some()
             || self.quit_confirm
         {
             return;
@@ -1682,6 +1730,170 @@ impl BrowDeckApp {
         }
     }
 
+    /// Shown once an extraction reports needing a password (see
+    /// `PasswordPrompt`). Two-stage name field, same reasoning as
+    /// `show_rename_editor`'s own — a real `TextEdit` only while
+    /// `password_prompt_editing` is true, otherwise a plain navigable
+    /// badge, so the very next d-pad press after this row opens doesn't
+    /// get eaten as a cursor move instead of navigation.
+    fn show_password_prompt_zone(&mut self, ui: &mut egui::Ui) {
+        // Resolve any in-flight retry first — same take-then-reassign
+        // shape as `update_install`, so mutating `self.password_prompt`
+        // here doesn't fight a live borrow of it.
+        if let Some(mut prompt) = self.password_prompt.take() {
+            if let Some(mut job) = prompt.job.take() {
+                job.poll();
+                if job.finished {
+                    if job.needs_password {
+                        // Wrong password — straight back into editing,
+                        // no need to make the user press A/click again.
+                        prompt.error = Some("Wrong password — try again".to_string());
+                        prompt.password.clear();
+                        self.password_prompt_editing = true;
+                        self.password_prompt_focus_pending = true;
+                    } else if let Some(err) = job.error {
+                        prompt.error = Some(err);
+                    } else {
+                        if matches!(self.view, View::Dir) {
+                            self.refresh();
+                        }
+                        return;
+                    }
+                } else {
+                    ui.ctx().request_repaint_after(Duration::from_millis(100));
+                    prompt.job = Some(job);
+                }
+            }
+            self.password_prompt = Some(prompt);
+        }
+        let Some(prompt) = &mut self.password_prompt else {
+            return;
+        };
+        let archive_path = prompt.retry.archive.to_string_lossy().into_owned();
+        let archive_name = prompt
+            .retry
+            .archive
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| archive_path.clone());
+        let in_flight = prompt.job.is_some();
+        // Taken, not cloned, and put back after the row closure — same
+        // reasoning as `show_rename_editor`'s own `text` field.
+        let mut password = std::mem::take(&mut prompt.password);
+        let error = prompt.error.clone();
+        let editing = self.password_prompt_editing;
+        let focus_pending = self.password_prompt_focus_pending;
+        let mut cancel = false;
+        let mut submit = false;
+        let mut first_id = None;
+        let mut field_id = None;
+        let mut row_ids: Vec<egui::Id> = Vec::new();
+        ui.horizontal_wrapped(|ui| {
+            let close = Self::action_badge(self.badge_min_height(), ui, self.icon(ICON_CLOSE));
+            row_ids.push(close.id);
+            if close.clicked() {
+                cancel = true;
+            }
+            ui.strong("Password");
+            ui.weak(&archive_name).on_hover_text(&archive_path);
+            ui.separator();
+            if in_flight {
+                Self::action_badge_disabled(self.badge_min_height(), ui, "Extracting…");
+            } else {
+                if editing {
+                    let text_resp = ui.add(
+                        egui::TextEdit::singleline(&mut password)
+                            .password(true)
+                            .hint_text("Password")
+                            .desired_width(160.0),
+                    );
+                    field_id = Some(text_resp.id);
+                    row_ids.push(text_resp.id);
+                    if text_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        submit = true;
+                    }
+                } else {
+                    let label = if password.is_empty() {
+                        "Password".to_string()
+                    } else {
+                        "•".repeat(password.chars().count())
+                    };
+                    let field = Self::action_badge(self.badge_min_height(), ui, label)
+                        .on_hover_text("Press A (or click) to enter the password");
+                    first_id.get_or_insert(field.id);
+                    field_id = Some(field.id);
+                    row_ids.push(field.id);
+                    if field.clicked() {
+                        self.password_prompt_editing = true;
+                        self.password_prompt_focus_pending = true;
+                    }
+                }
+                ui.separator();
+                let extract_btn = Self::action_badge(self.badge_min_height(), ui, "Extract");
+                row_ids.push(extract_btn.id);
+                if extract_btn.clicked() {
+                    submit = true;
+                }
+                let cancel_btn = Self::action_badge(self.badge_min_height(), ui, "Cancel");
+                row_ids.push(cancel_btn.id);
+                if cancel_btn.clicked() {
+                    cancel = true;
+                }
+            }
+            if let Some(err) = &error {
+                ui.separator();
+                ui.colored_label(egui::Color32::RED, err);
+            }
+        });
+        self.right_focus_rows.push(row_ids);
+        if focus_pending && let Some(id) = field_id {
+            self.set_focus(ui.ctx(), id);
+            self.password_prompt_focus_pending = false;
+        }
+        if let Some(prompt) = &mut self.password_prompt {
+            prompt.password = password;
+        }
+        if submit && !in_flight {
+            if let Some(prompt) = &mut self.password_prompt {
+                if prompt.password.is_empty() {
+                    eprintln!("password can't be empty");
+                } else {
+                    let retry = prompt.retry.clone();
+                    let password = prompt.password.clone();
+                    let job = match retry.rar_tool.clone() {
+                        Some(tool) => fileops::spawn_extract_rar_with_password(
+                            tool,
+                            retry.archive.clone(),
+                            retry.dest_dir.clone(),
+                            password,
+                        ),
+                        None => fileops::spawn_extract_with_password(
+                            retry.archive.clone(),
+                            retry.dest_dir.clone(),
+                            password,
+                        ),
+                    };
+                    prompt.job = Some(job);
+                    prompt.error = None;
+                    self.password_prompt_editing = false;
+                }
+            }
+        } else if cancel {
+            self.password_prompt = None;
+            self.password_prompt_editing = false;
+        }
+        if self.password_prompt.is_none() {
+            self.password_prompt_editing = false;
+        }
+        if self.focus_first_action
+            && self.password_prompt.is_some()
+            && let Some(id) = first_id
+        {
+            ui.ctx().memory_mut(|m| m.request_focus(id));
+            self.focus_first_action = false;
+        }
+    }
+
     /// Persistent bottom bar: an always-visible gamepad button legend
     /// (only while a real gamepad is connected) plus the app version,
     /// rather than scattering button hints next to individual controls.
@@ -1899,6 +2111,32 @@ impl eframe::App for BrowDeckApp {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
 
+        // A finished extraction that turns out to need a password gets
+        // promoted into `password_prompt` (if nothing's already using
+        // it) instead of lingering as a dead-end red error line in
+        // Progress — see `PasswordPrompt`'s own doc comment. If more
+        // than one job needs one simultaneously, only the first is
+        // claimed; the rest just show their "password required" error
+        // and age out normally (a rare enough case not to build a queue
+        // for).
+        if self.password_prompt.is_none()
+            && let Some(idx) = self
+                .jobs
+                .iter()
+                .position(|j| j.needs_password && j.retry.is_some())
+        {
+            let job = self.jobs.remove(idx);
+            self.password_prompt = Some(PasswordPrompt {
+                retry: job.retry.unwrap(),
+                password: String::new(),
+                error: None,
+                job: None,
+            });
+            self.password_prompt_editing = false;
+            self.password_prompt_focus_pending = false;
+            self.focus_first_action = true;
+        }
+
         if let Some(check) = &self.update_check {
             if let Some(result) = check.poll() {
                 self.update_check = None;
@@ -1987,6 +2225,15 @@ impl eframe::App for BrowDeckApp {
                     if matches!(action, gamepad::Action::Back) {
                         self.compress_editing = false;
                         self.compress_focus_pending = true;
+                    }
+                    continue;
+                }
+                // Same reasoning as `rename_editing` above, for the
+                // password prompt's own field.
+                if self.password_prompt_editing {
+                    if matches!(action, gamepad::Action::Back) {
+                        self.password_prompt_editing = false;
+                        self.password_prompt_focus_pending = true;
                     }
                     continue;
                 }
@@ -2349,6 +2596,7 @@ impl eframe::App for BrowDeckApp {
             Permissions,
             Menu,
             UpdateAvailable,
+            PasswordPrompt,
             Progress,
             UpdateReady,
             Quit,
@@ -2378,6 +2626,14 @@ impl eframe::App for BrowDeckApp {
                 if show_permissions {
                     active_zones.push(FooterZone::Permissions);
                 }
+            }
+            // Independent of Actions/Menu — a password prompt is
+            // discovered asynchronously (after Extract has already
+            // closed Actions per this app's own close-behavior
+            // convention), so it can't be nested under either branch
+            // above the way Rename/Compress/Permissions are.
+            if self.password_prompt.is_some() {
+                active_zones.push(FooterZone::PasswordPrompt);
             }
             if show_progress {
                 active_zones.push(FooterZone::Progress);
@@ -2482,6 +2738,9 @@ impl eframe::App for BrowDeckApp {
                                     FooterZone::Menu => self.show_menu_zone(ui),
                                     FooterZone::UpdateAvailable => {
                                         self.show_update_available_zone(ui)
+                                    }
+                                    FooterZone::PasswordPrompt => {
+                                        self.show_password_prompt_zone(ui)
                                     }
                                     FooterZone::Progress => self.show_progress_zone(ui),
                                     FooterZone::UpdateReady => self.show_update_ready_zone(ui),

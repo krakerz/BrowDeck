@@ -122,6 +122,8 @@ pub fn spawn_install(release: ReleaseInfo) -> Job {
         finished: false,
         error: None,
         finished_at: None,
+        needs_password: false,
+        retry: None,
     }
 }
 
