@@ -1,5 +1,14 @@
 ## [Unreleased]
 
+## [1.8.0] — 2026-09-17
+
+### Added
+- R3 now opens a Menu (Check for Update, Quit) instead of asking to quit
+  directly — Quit still works the same way once you pick it there
+- Check for Update: looks up the latest published GitHub release: if
+  it's newer, offers to download it, replace the installed binary, and
+  prompts a restart once done
+
 ## [1.7.0] — 2026-09-09
 
 ### Added

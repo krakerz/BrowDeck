@@ -12,6 +12,7 @@ mod mounts;
 mod permissions;
 mod places;
 mod preview;
+mod update;
 
 fn main() -> eframe::Result<()> {
     let config = config::Config::load();

@@ -1,6 +1,6 @@
 [package]
 name = "browdeck"
-version = "1.7.0"
+version = "1.8.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
@@ -18,7 +18,9 @@ gilrs = "0.11.2"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "ico", "tiff"] }
 open = "5.4.3"
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 tar = { version = "0.4.46", default-features = false }
 toml = "1.1.5"
 trash = "5.2.7"
+ureq = "3.4.2"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
