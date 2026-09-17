@@ -1,6 +1,6 @@
 [package]
 name = "browdeck"
-version = "1.9.0"
+version = "1.10.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
@@ -23,4 +23,4 @@ tar = { version = "0.4.46", default-features = false }
 toml = "1.1.5"
 trash = "5.2.7"
 ureq = "3.4.2"
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate", "aes-crypto"] }

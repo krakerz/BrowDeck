@@ -4,9 +4,31 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 
 pub enum ProgressMsg {
-    Progress { done: u64, total: u64 },
+    Progress {
+        done: u64,
+        total: u64,
+    },
     Done,
     Error(String),
+    /// The archive needs a password that wasn't (or wasn't correctly)
+    /// supplied — distinct from `Error` so the UI can offer a retry
+    /// instead of just reporting a dead end. See `Job::retry`.
+    PasswordRequired,
+}
+
+/// Enough to re-attempt an extraction with a password once a first try
+/// (without one) turns out to need one — carried on the `Job` itself
+/// rather than a separate tracking structure, since the archive/dest/
+/// tool are already known the moment the job is first spawned.
+#[derive(Clone)]
+pub struct ExtractRetry {
+    pub archive: PathBuf,
+    pub dest_dir: PathBuf,
+    /// `Some(tool)` for `.rar` (retry via `spawn_extract_rar_with_password`);
+    /// `None` for native zip/tar (retry via `spawn_extract_with_password` —
+    /// though plain tar/tar.gz never actually reports `needs_password`,
+    /// since the format has no such concept).
+    pub rar_tool: Option<PathBuf>,
 }
 
 pub struct Job {
@@ -17,6 +39,13 @@ pub struct Job {
     pub finished: bool,
     pub error: Option<String>,
     pub finished_at: Option<Instant>,
+    /// Set when a `ProgressMsg::PasswordRequired` arrives — the app
+    /// checks this (alongside `retry`) to offer a password-entry retry
+    /// instead of treating this like any other failed job.
+    pub needs_password: bool,
+    /// `None` for every job that isn't an archive extraction (copy/
+    /// move/compress/update-install).
+    pub retry: Option<ExtractRetry>,
 }
 
 impl Job {
@@ -34,6 +63,12 @@ impl Job {
                 }
                 ProgressMsg::Error(e) => {
                     self.error = Some(e);
+                    self.finished = true;
+                    self.finished_at = Some(Instant::now());
+                }
+                ProgressMsg::PasswordRequired => {
+                    self.needs_password = true;
+                    self.error = Some("password required".to_string());
                     self.finished = true;
                     self.finished_at = Some(Instant::now());
                 }
@@ -90,9 +125,60 @@ pub fn is_rar(path: &Path) -> bool {
     matches!(archive_kind(path), Some(ArchiveKind::Rar))
 }
 
+/// What an extraction attempt can fail with — distinct from a plain
+/// `String` so callers (`run_extract`/`run_extract_rar`) can tell
+/// "needs a password" apart from every other failure and send the
+/// right `ProgressMsg` instead of collapsing both into `Error`.
+enum ExtractFailure {
+    PasswordRequired,
+    Error(String),
+}
+
+impl From<std::io::Error> for ExtractFailure {
+    fn from(e: std::io::Error) -> Self {
+        ExtractFailure::Error(e.to_string())
+    }
+}
+
+impl From<zip::result::ZipError> for ExtractFailure {
+    fn from(e: zip::result::ZipError) -> Self {
+        // Two distinct variants both mean "needs a password", depending
+        // on whether one was tried at all: `by_index` (no password)
+        // returns `UnsupportedArchive(PASSWORD_REQUIRED)` for an
+        // encrypted entry; `by_index_decrypt` returns `InvalidPassword`
+        // specifically when the one *given* turns out to be wrong.
+        // Missing the first of these was the actual bug — a plain
+        // Extract on a password-protected zip fell through to a raw
+        // "unsupported Zip archive: Password required to decrypt file"
+        // error instead of opening the password prompt at all.
+        match e {
+            zip::result::ZipError::InvalidPassword => ExtractFailure::PasswordRequired,
+            zip::result::ZipError::UnsupportedArchive(zip::result::ZipError::PASSWORD_REQUIRED) => {
+                ExtractFailure::PasswordRequired
+            }
+            other => ExtractFailure::Error(other.to_string()),
+        }
+    }
+}
+
 pub fn spawn_extract(archive: PathBuf, dest_dir: PathBuf) -> Job {
+    spawn_extract_impl(archive, dest_dir, None)
+}
+
+/// Retries an extraction that previously reported `needs_password`,
+/// this time with a password to try.
+pub fn spawn_extract_with_password(archive: PathBuf, dest_dir: PathBuf, password: String) -> Job {
+    spawn_extract_impl(archive, dest_dir, Some(password))
+}
+
+fn spawn_extract_impl(archive: PathBuf, dest_dir: PathBuf, password: Option<String>) -> Job {
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || run_extract(&archive, &dest_dir, &tx));
+    let retry = ExtractRetry {
+        archive: archive.clone(),
+        dest_dir: dest_dir.clone(),
+        rar_tool: None,
+    };
+    std::thread::spawn(move || run_extract(&archive, &dest_dir, password.as_deref(), &tx));
     Job {
         label: "Extracting".to_string(),
         receiver: rx,
@@ -101,63 +187,74 @@ pub fn spawn_extract(archive: PathBuf, dest_dir: PathBuf) -> Job {
         finished: false,
         error: None,
         finished_at: None,
+        needs_password: false,
+        retry: Some(retry),
     }
 }
 
-fn run_extract(archive_path: &Path, dest_dir: &Path, tx: &Sender<ProgressMsg>) {
-    let result = match archive_kind(archive_path) {
-        Some(ArchiveKind::Zip) => extract_zip(archive_path, dest_dir, tx),
-        Some(ArchiveKind::Tar) => extract_tar(archive_path, dest_dir, tx),
-        Some(ArchiveKind::TarGz) => extract_tar_gz(archive_path, dest_dir, tx),
+fn run_extract(
+    archive_path: &Path,
+    dest_dir: &Path,
+    password: Option<&str>,
+    tx: &Sender<ProgressMsg>,
+) {
+    let result: Result<(), ExtractFailure> = match archive_kind(archive_path) {
+        Some(ArchiveKind::Zip) => extract_zip(archive_path, dest_dir, password, tx),
+        Some(ArchiveKind::Tar) => {
+            extract_tar(archive_path, dest_dir, tx).map_err(ExtractFailure::Error)
+        }
+        Some(ArchiveKind::TarGz) => {
+            extract_tar_gz(archive_path, dest_dir, tx).map_err(ExtractFailure::Error)
+        }
         // Callers route `.rar` through `spawn_extract_rar` instead —
         // reachable here only if that dispatch is ever bypassed.
-        Some(ArchiveKind::Rar) => Err("use spawn_extract_rar for .rar archives".to_string()),
-        None => Err("unsupported archive format".to_string()),
+        Some(ArchiveKind::Rar) => Err(ExtractFailure::Error(
+            "use spawn_extract_rar for .rar archives".to_string(),
+        )),
+        None => Err(ExtractFailure::Error(
+            "unsupported archive format".to_string(),
+        )),
     };
     match result {
         Ok(()) => {
             let _ = tx.send(ProgressMsg::Done);
         }
-        Err(e) => {
+        Err(ExtractFailure::PasswordRequired) => {
+            let _ = tx.send(ProgressMsg::PasswordRequired);
+        }
+        Err(ExtractFailure::Error(e)) => {
             let _ = tx.send(ProgressMsg::Error(e));
         }
-    }
-}
-
-/// Friendlier message for the one error case a user can actually do
-/// something about (well, can't, but at least understands why) —
-/// everything else keeps the crate's own message as-is.
-fn zip_extract_error(e: zip::result::ZipError) -> String {
-    if matches!(e, zip::result::ZipError::InvalidPassword) {
-        "archive is password-protected (not supported)".to_string()
-    } else {
-        e.to_string()
     }
 }
 
 fn extract_zip(
     archive_path: &Path,
     dest_dir: &Path,
+    password: Option<&str>,
     tx: &Sender<ProgressMsg>,
-) -> Result<(), String> {
-    let file = std::fs::File::open(archive_path).map_err(|e| e.to_string())?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+) -> Result<(), ExtractFailure> {
+    let file = std::fs::File::open(archive_path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
     let total = archive.len().max(1) as u64;
     let _ = tx.send(ProgressMsg::Progress { done: 0, total });
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(zip_extract_error)?;
+        let mut entry = match password {
+            Some(pw) => archive.by_index_decrypt(i, pw.as_bytes())?,
+            None => archive.by_index(i)?,
+        };
         // `enclosed_name` rejects absolute paths and `..` components —
         // skip anything a malicious archive could use to escape dest_dir.
         if let Some(rel_path) = entry.enclosed_name() {
             let out_path = dest_dir.join(rel_path);
             if entry.is_dir() {
-                std::fs::create_dir_all(&out_path).map_err(|e| e.to_string())?;
+                std::fs::create_dir_all(&out_path)?;
             } else {
                 if let Some(parent) = out_path.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                    std::fs::create_dir_all(parent)?;
                 }
-                let mut out_file = std::fs::File::create(&out_path).map_err(|e| e.to_string())?;
-                std::io::copy(&mut entry, &mut out_file).map_err(|e| e.to_string())?;
+                let mut out_file = std::fs::File::create(&out_path)?;
+                std::io::copy(&mut entry, &mut out_file)?;
             }
         }
         let _ = tx.send(ProgressMsg::Progress {
@@ -250,8 +347,35 @@ pub fn detect_rar_tool() -> Option<PathBuf> {
 /// real per-entry progress out of an external process's own stdout would
 /// mean parsing tool- and version-specific output formats.
 pub fn spawn_extract_rar(tool: PathBuf, archive: PathBuf, dest_dir: PathBuf) -> Job {
+    spawn_extract_rar_impl(tool, archive, dest_dir, None)
+}
+
+/// Retries a `.rar` extraction that previously reported `needs_password`,
+/// this time with a password to try.
+pub fn spawn_extract_rar_with_password(
+    tool: PathBuf,
+    archive: PathBuf,
+    dest_dir: PathBuf,
+    password: String,
+) -> Job {
+    spawn_extract_rar_impl(tool, archive, dest_dir, Some(password))
+}
+
+fn spawn_extract_rar_impl(
+    tool: PathBuf,
+    archive: PathBuf,
+    dest_dir: PathBuf,
+    password: Option<String>,
+) -> Job {
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || run_extract_rar(&tool, &archive, &dest_dir, &tx));
+    let retry = ExtractRetry {
+        archive: archive.clone(),
+        dest_dir: dest_dir.clone(),
+        rar_tool: Some(tool.clone()),
+    };
+    std::thread::spawn(move || {
+        run_extract_rar(&tool, &archive, &dest_dir, password.as_deref(), &tx)
+    });
     Job {
         label: "Extracting".to_string(),
         receiver: rx,
@@ -260,49 +384,67 @@ pub fn spawn_extract_rar(tool: PathBuf, archive: PathBuf, dest_dir: PathBuf) -> 
         finished: false,
         error: None,
         finished_at: None,
+        needs_password: false,
+        retry: Some(retry),
     }
 }
 
-fn run_extract_rar(tool: &Path, archive: &Path, dest_dir: &Path, tx: &Sender<ProgressMsg>) {
+fn run_extract_rar(
+    tool: &Path,
+    archive: &Path,
+    dest_dir: &Path,
+    password: Option<&str>,
+    tx: &Sender<ProgressMsg>,
+) {
     let _ = tx.send(ProgressMsg::Progress { done: 0, total: 1 });
-    match extract_rar_command(tool, archive, dest_dir) {
+    match extract_rar_command(tool, archive, dest_dir, password) {
         Ok(()) => {
             let _ = tx.send(ProgressMsg::Done);
         }
-        Err(e) => {
+        Err(ExtractFailure::PasswordRequired) => {
+            let _ = tx.send(ProgressMsg::PasswordRequired);
+        }
+        Err(ExtractFailure::Error(e)) => {
             let _ = tx.send(ProgressMsg::Error(e));
         }
     }
 }
 
-fn extract_rar_command(tool: &Path, archive: &Path, dest_dir: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
+fn extract_rar_command(
+    tool: &Path,
+    archive: &Path,
+    dest_dir: &Path,
+    password: Option<&str>,
+) -> Result<(), ExtractFailure> {
+    std::fs::create_dir_all(dest_dir).map_err(|e| ExtractFailure::Error(e.to_string()))?;
     let mut command = std::process::Command::new(tool);
     match tool.file_name().and_then(|n| n.to_str()) {
         Some("7z") | Some("7za") => {
+            command.arg("x").arg("-y");
+            if let Some(pw) = password {
+                command.arg(format!("-p{pw}"));
+            }
             command
-                .arg("x")
-                .arg("-y")
                 .arg(format!("-o{}", dest_dir.display()))
                 .arg(archive);
         }
         // unrar: `x` extracts with full paths, `-y` assumes yes to any
-        // prompt, `-p-` disables the password prompt outright (fails
-        // fast on an encrypted archive instead of however it'd otherwise
-        // behave reading from the closed stdin below).
+        // prompt, `-p<password>` supplies one; with none given, `-p-`
+        // disables the password prompt outright (fails fast on an
+        // encrypted archive instead of however it'd otherwise behave
+        // reading from the closed stdin below).
         _ => {
-            command
-                .arg("x")
-                .arg("-y")
-                .arg("-p-")
-                .arg(archive)
-                .arg(format!("{}/", dest_dir.display()));
+            command.arg("x").arg("-y").arg(match password {
+                Some(pw) => format!("-p{pw}"),
+                None => "-p-".to_string(),
+            });
+            command.arg(archive).arg(format!("{}/", dest_dir.display()));
         }
     }
     let output = command
         .stdin(std::process::Stdio::null())
         .output()
-        .map_err(|e| format!("couldn't run {}: {e}", tool.display()))?;
+        .map_err(|e| ExtractFailure::Error(format!("couldn't run {}: {e}", tool.display())))?;
     if output.status.success() {
         return Ok(());
     }
@@ -314,9 +456,9 @@ fn extract_rar_command(tool: &Path, archive: &Path, dest_dir: &Path) -> Result<(
         stderr.trim()
     };
     if message.to_lowercase().contains("password") {
-        Err("archive is password-protected (not supported)".to_string())
+        Err(ExtractFailure::PasswordRequired)
     } else {
-        Err(format!("extract failed: {message}"))
+        Err(ExtractFailure::Error(format!("extract failed: {message}")))
     }
 }
 
@@ -337,6 +479,8 @@ pub fn spawn_compress(sources: Vec<PathBuf>, dest: PathBuf, kind: CompressKind) 
         finished: false,
         error: None,
         finished_at: None,
+        needs_password: false,
+        retry: None,
     }
 }
 
@@ -503,6 +647,8 @@ fn spawn_job(label: &str, sources: Vec<PathBuf>, dest_dir: PathBuf, is_move: boo
         finished: false,
         error: None,
         finished_at: None,
+        needs_password: false,
+        retry: None,
     }
 }
 
@@ -654,6 +800,7 @@ mod tests {
                 }
                 ProgressMsg::Done => return Ok((done, total)),
                 ProgressMsg::Error(e) => return Err(e),
+                ProgressMsg::PasswordRequired => return Err("password required".to_string()),
             }
         }
     }
@@ -727,20 +874,35 @@ mod tests {
     }
 
     #[test]
-    fn zip_extract_error_gives_a_friendly_message_for_invalid_password() {
-        assert_eq!(
-            zip_extract_error(zip::result::ZipError::InvalidPassword),
-            "archive is password-protected (not supported)"
-        );
+    fn extract_failure_from_zip_error_maps_invalid_password_to_password_required() {
+        assert!(matches!(
+            ExtractFailure::from(zip::result::ZipError::InvalidPassword),
+            ExtractFailure::PasswordRequired
+        ));
     }
 
     #[test]
-    fn zip_extract_error_passes_other_errors_through_unchanged() {
+    fn extract_failure_from_zip_error_maps_unsupported_archive_password_required_too() {
+        // This is what a *first* attempt (no password given at all)
+        // actually returns — `InvalidPassword` alone missed this case
+        // entirely, so a plain Extract on a password-protected zip fell
+        // through to a raw "unsupported Zip archive: Password required
+        // to decrypt file" error instead of ever opening the prompt.
+        assert!(matches!(
+            ExtractFailure::from(zip::result::ZipError::UnsupportedArchive(
+                zip::result::ZipError::PASSWORD_REQUIRED
+            )),
+            ExtractFailure::PasswordRequired
+        ));
+    }
+
+    #[test]
+    fn extract_failure_from_zip_error_passes_other_errors_through_as_error() {
         let e = zip::result::ZipError::FileNotFound;
-        assert_eq!(
-            zip_extract_error(zip::result::ZipError::FileNotFound),
-            e.to_string()
-        );
+        match ExtractFailure::from(zip::result::ZipError::FileNotFound) {
+            ExtractFailure::Error(msg) => assert_eq!(msg, e.to_string()),
+            ExtractFailure::PasswordRequired => panic!("expected Error, got PasswordRequired"),
+        }
     }
 
     #[test]
@@ -762,7 +924,7 @@ mod tests {
         std::fs::write(&fake, b"this is not a rar archive").unwrap();
         let dest = root.join("dest");
 
-        let result = extract_rar_command(&tool, &fake, &dest);
+        let result = extract_rar_command(&tool, &fake, &dest, None);
         assert!(result.is_err());
 
         std::fs::remove_dir_all(&root).unwrap();
@@ -797,6 +959,57 @@ mod tests {
             "hello from zip"
         );
         assert!(!root.join("escape.txt").exists());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn extract_password_protected_zip_needs_a_password_then_succeeds_with_the_right_one() {
+        let root = scratch_dir("extract_password");
+        let archive_path = root.join("secret.zip");
+        {
+            let file = std::fs::File::create(&archive_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default()
+                .with_aes_encryption(zip::AesMode::Aes256, "hunter2");
+            zip.start_file("inside.txt", options).unwrap();
+            zip.write_all(b"hello from an encrypted zip").unwrap();
+            zip.finish().unwrap();
+        }
+        let dest_dir = root.join("dest");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+
+        // No password at all — this is the exact case that was broken:
+        // `by_index` (no password) signals via `UnsupportedArchive(
+        // PASSWORD_REQUIRED)`, a different variant than the
+        // wrong-password case below, and it was the only one actually
+        // missed by the original `From` mapping.
+        let job = spawn_extract(archive_path.clone(), dest_dir.clone());
+        assert_eq!(
+            wait_done(&job.receiver),
+            Err("password required".to_string())
+        );
+
+        // Wrong password.
+        let job = spawn_extract_with_password(
+            archive_path.clone(),
+            dest_dir.clone(),
+            "not-it".to_string(),
+        );
+        assert_eq!(
+            wait_done(&job.receiver),
+            Err("password required".to_string())
+        );
+
+        // Right password.
+        let job =
+            spawn_extract_with_password(archive_path, dest_dir.clone(), "hunter2".to_string());
+        let (done, total) = wait_done(&job.receiver).unwrap();
+        assert_eq!(done, total);
+        assert_eq!(
+            std::fs::read_to_string(dest_dir.join("inside.txt")).unwrap(),
+            "hello from an encrypted zip"
+        );
 
         std::fs::remove_dir_all(&root).unwrap();
     }
