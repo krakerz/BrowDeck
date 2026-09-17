@@ -1,5 +1,12 @@
 ## [Unreleased]
 
+## [1.9.1] — 2026-09-17
+
+### Fixed
+- Checking for an update and installing it showed no progress at all
+  while downloading/extracting — the install job wasn't wired into the
+  Progress row
+
 ## [1.9.0] — 2026-09-17
 
 ### Added

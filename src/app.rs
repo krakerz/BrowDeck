@@ -2316,7 +2316,12 @@ impl eframe::App for BrowDeckApp {
         let show_rename = self.rename_editor.is_some();
         let show_compress = self.compress_editor.is_some();
         let show_permissions = self.perm_editor.is_some();
-        let show_progress = !self.jobs.is_empty();
+        // `update_install` is polled the same way as `self.jobs` (see its
+        // own field doc comment for why it's kept separate) but needs to
+        // count here too, or its download/extract progress never gets a
+        // visible row at all — reported by the user: the update itself
+        // worked, but nothing showed while it was running.
+        let show_progress = !self.jobs.is_empty() || self.update_install.is_some();
         // Whichever of Rename/Compress/Permissions is open (never more
         // than one — see `close_sub_editors`) shares one header above it
         // instead of repeating "the file/folder this row acts on" itself
@@ -3762,7 +3767,12 @@ impl BrowDeckApp {
     }
 
     fn show_progress_zone(&self, ui: &mut egui::Ui) {
-        for job in &self.jobs {
+        // `update_install` isn't part of `self.jobs` (see its own field
+        // doc comment for why), but it's a `fileops::Job` all the same —
+        // shows here too, chained on the end, so the download/extract
+        // step actually gets a visible row instead of running silently.
+        let update_job = self.update_install.as_ref().map(|(job, _)| job);
+        for job in self.jobs.iter().chain(update_job) {
             ui.horizontal(|ui| {
                 ui.strong("Progress");
                 if let Some(err) = &job.error {
