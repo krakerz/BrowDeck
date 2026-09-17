@@ -35,7 +35,9 @@ default; borderless fullscreen is available via `config.toml`.
 - Material Design icons; LT/RT adjusts the scale of the sidebar and main
   pane specifically
 - CJK (Japanese/Chinese/Korean) filename rendering
-- R3 to quit, with a confirmation in the actions strip
+- R3 opens a Menu (Quit, with a confirmation step, and Check for Update)
+- Check for Update looks up the latest published GitHub release and, if
+  it's newer, downloads and installs it in place (prompts a restart)
 - Optional IProLaunch integration — an "Add to IProLaunch" action for
   `.exe`/`.bat` files when IProLaunch is installed
 
@@ -78,7 +80,7 @@ Navigate with the d-pad or left stick; the right stick moves the selection
 | Y (tap)   | Refresh the active pane                     |
 | Y (hold)  | Search                                      |
 | L3        | Toggle multi-select                         |
-| R3        | Quit (asks for confirmation in the actions strip) |
+| R3        | Menu (Check for Update, Quit)                |
 | Start     | Open the selected item                      |
 | Select    | Toggle preview pane width                   |
 | LB / RB   | Switch pane (Sidebar / main list / Preview / Toolbar) |
@@ -100,6 +102,13 @@ legend always shows as a reference for the equivalents.
 **Does it follow symlinks?**
 Directory listings and navigation follow symlinks; recursive search
 doesn't descend into symlinked directories, to avoid loops.
+
+**How does Check for Update work?**
+Manual only — nothing is checked automatically. R3 → Menu → Check for
+Update looks up the latest *published* GitHub release (drafts aren't
+visible to it) and compares it against the running version. If it's
+newer, a row offers to download and install it: BrowDeck replaces its own
+installed binary in place and asks you to restart to finish.
 
 **How does the IProLaunch integration work?**
 At startup, BrowDeck checks `~/.config/iprolaunch/bin-path` for the

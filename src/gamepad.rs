@@ -41,19 +41,19 @@ pub enum Action {
     ScaleUp,
     /// Start — open the selected file directly, bypassing the actions
     /// panel. Deliberately the *only* thing Start does — holding it was
-    /// tried for `Quit` and turned out to trigger Steam Input's own
-    /// mouse/gamepad-mode remapping regardless of what BrowDeck does in
-    /// response, so Start can't be repurposed for anything beyond a
-    /// plain tap.
+    /// tried for `Menu` (née `Quit`) and turned out to trigger Steam
+    /// Input's own mouse/gamepad-mode remapping regardless of what
+    /// BrowDeck does in response, so Start can't be repurposed for
+    /// anything beyond a plain tap.
     Open,
     /// Right stick — continuous scroll, sent every frame it's tilted past
     /// the deadzone (magnitude/direction, not an edge-triggered move).
     Scroll(f32),
-    /// R3 — asks for confirmation before closing the app (no keyboard
-    /// Alt+F4 to rely on under gamescope/Game Mode). A plain press, not
-    /// held — the confirmation strip it opens (Quit/Cancel) is already
-    /// the safety gate, no separate hold timer needed on top of it.
-    Quit,
+    /// R3 — opens the app menu (Check for Update, Quit). A plain press,
+    /// not held — same reasoning as the old direct-Quit binding this
+    /// replaced: holding a button was what actually broke gamepad input
+    /// under Steam Input, not the confirmation step itself.
+    Menu,
 }
 
 pub struct GamepadInput {
@@ -205,7 +205,7 @@ fn action_for(button: Button) -> Option<Action> {
         Button::LeftTrigger2 => Some(Action::ScaleDown),
         Button::RightTrigger2 => Some(Action::ScaleUp),
         Button::LeftThumb => Some(Action::ToggleMultiSelect),
-        Button::RightThumb => Some(Action::Quit),
+        Button::RightThumb => Some(Action::Menu),
         _ => None,
     }
 }

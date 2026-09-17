@@ -1,16 +1,17 @@
 use crate::{
     custom_places, deleted, fileicons, fileinfo, fileops, fonts, gamepad, iprolaunch, mounts,
-    permissions, places, preview,
+    permissions, places, preview, update,
 };
 use egui_material_icons::MaterialIcon;
 use egui_material_icons::icons::{
     ICON_ACCOUNT_TREE, ICON_ARCHIVE, ICON_ARROW_DOWNWARD, ICON_ARROW_UPWARD, ICON_BOOKMARK,
-    ICON_CHECK_CIRCLE, ICON_CLOSE, ICON_CONTENT_COPY, ICON_CONTENT_CUT, ICON_CONTENT_PASTE,
-    ICON_CREATE_NEW_FOLDER, ICON_DELETE, ICON_DELETE_SWEEP, ICON_DRIVE_FILE_RENAME_OUTLINE,
-    ICON_FOLDER_ZIP, ICON_GAMEPAD, ICON_KEEP, ICON_KEEP_OFF, ICON_LOCK, ICON_MENU,
-    ICON_OPEN_IN_NEW, ICON_PREVIEW, ICON_PRIORITY_HIGH, ICON_REFRESH, ICON_RESTORE_FROM_TRASH,
-    ICON_ROCKET_LAUNCH, ICON_SEARCH, ICON_SORT, ICON_UNARCHIVE, ICON_VISIBILITY,
-    ICON_VISIBILITY_OFF, ICON_ZOOM_IN, ICON_ZOOM_OUT,
+    ICON_CHECK_CIRCLE, ICON_CLOSE, ICON_CLOUD_DOWNLOAD, ICON_CONTENT_COPY, ICON_CONTENT_CUT,
+    ICON_CONTENT_PASTE, ICON_CREATE_NEW_FOLDER, ICON_DELETE, ICON_DELETE_SWEEP,
+    ICON_DRIVE_FILE_RENAME_OUTLINE, ICON_FOLDER_ZIP, ICON_GAMEPAD, ICON_KEEP, ICON_KEEP_OFF,
+    ICON_LOCK, ICON_LOGOUT, ICON_MENU, ICON_OPEN_IN_NEW, ICON_PREVIEW, ICON_PRIORITY_HIGH,
+    ICON_REFRESH, ICON_RESTART_ALT, ICON_RESTORE_FROM_TRASH, ICON_ROCKET_LAUNCH, ICON_SEARCH,
+    ICON_SORT, ICON_SYSTEM_UPDATE, ICON_UNARCHIVE, ICON_VISIBILITY, ICON_VISIBILITY_OFF,
+    ICON_ZOOM_IN, ICON_ZOOM_OUT,
 };
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -342,6 +343,29 @@ pub struct BrowDeckApp {
     /// rendered (see NOTES.md "holding Start itself breaks gamepad
     /// input").
     quit_confirm: bool,
+    /// True while the R3 menu (Check for Update, Quit) is showing —
+    /// `FooterZone::Menu`, opened by R3 in place of the old direct-Quit
+    /// trigger; clicking Quit inside it is what sets `quit_confirm`.
+    menu_open: bool,
+    /// In-flight "Check for Update" background request — see `update.rs`.
+    update_check: Option<update::CheckJob>,
+    /// Set once a check finds a real, newer, published release — drives
+    /// `FooterZone::UpdateAvailable`.
+    update_available: Option<update::ReleaseInfo>,
+    /// In-flight download-and-replace job (paired with the version it's
+    /// installing, needed once it finishes to populate `update_ready`),
+    /// polled the same way as `jobs` but kept separate so its completion
+    /// can drive the persistent `update_ready` prompt instead of the
+    /// ordinary Progress row's auto-lingering/auto-dismiss.
+    update_install: Option<(fileops::Job, String)>,
+    /// Set once `update_install` finishes successfully, holding the new
+    /// version string — drives the persistent "restart to finish
+    /// updating" row (`FooterZone::UpdateReady`), shown until the user
+    /// restarts or dismisses it.
+    update_ready: Option<String>,
+    /// Last Check-for-Update/install error, if any — shown inline in the
+    /// Menu row, cleared on the next Check attempt.
+    update_error: Option<String>,
     /// Whether the title header above the toolbar shows — from
     /// `config.toml`'s `show_header`, fixed for the life of the app (no
     /// in-app toggle, unlike `show_hidden_files`/`show_all_mounts`).
@@ -441,6 +465,12 @@ impl BrowDeckApp {
             multi_selected: std::collections::HashSet::new(),
             current_pane: None,
             quit_confirm: false,
+            menu_open: false,
+            update_check: None,
+            update_available: None,
+            update_install: None,
+            update_ready: None,
+            update_error: None,
             show_header,
             // See `reassert_window_size`'s doc comment — ~30 frames
             // (roughly half a second) of retries, generous enough to
@@ -691,7 +721,23 @@ impl BrowDeckApp {
             // its focus went stale while the Quit row had it instead;
             // re-prime so it lands somewhere real again next frame,
             // same as every other zone-closes-but-another-stays-open
-            // transition below.
+            // transition below. Quit is only ever reached *from* Menu now
+            // (clicking Quit inside it), so `menu_open` is always the
+            // thing underneath in practice — included alongside the rest
+            // for the same reason they all are.
+            if self.context_menu_open
+                || self.rename_editor.is_some()
+                || self.perm_editor.is_some()
+                || self.compress_editor.is_some()
+                || self.menu_open
+            {
+                self.focus_first_action = true;
+            }
+        } else if self.menu_open {
+            self.menu_open = false;
+            // Same re-priming as `quit_confirm` above — Actions (or one
+            // of its sub-rows) may have been open the whole time, just
+            // hidden for the frame(s) Menu was showing on top of it.
             if self.context_menu_open
                 || self.rename_editor.is_some()
                 || self.perm_editor.is_some()
@@ -833,6 +879,9 @@ impl BrowDeckApp {
             || self.perm_editor.is_some()
             || self.rename_editor.is_some()
             || self.compress_editor.is_some()
+            || self.menu_open
+            || self.update_available.is_some()
+            || self.update_ready.is_some()
             || self.quit_confirm;
         if guard_active && !self.focus_inside_strip(ctx) {
             // Re-primes the same "focus this row's own first widget next
@@ -879,6 +928,9 @@ impl BrowDeckApp {
             || self.perm_editor.is_some()
             || self.rename_editor.is_some()
             || self.compress_editor.is_some()
+            || self.menu_open
+            || self.update_available.is_some()
+            || self.update_ready.is_some()
             || self.quit_confirm;
         if guard_active {
             let inside = self.focus_inside_strip(ctx);
@@ -1026,6 +1078,9 @@ impl BrowDeckApp {
             || self.perm_editor.is_some()
             || self.rename_editor.is_some()
             || self.compress_editor.is_some()
+            || self.menu_open
+            || self.update_available.is_some()
+            || self.update_ready.is_some()
             || self.quit_confirm
         {
             return;
@@ -1433,11 +1488,189 @@ impl BrowDeckApp {
                 || self.rename_editor.is_some()
                 || self.perm_editor.is_some()
                 || self.compress_editor.is_some()
+                || self.menu_open
             {
                 self.focus_first_action = true;
             }
         }
         if focus_pending_at_start && let Some(id) = first_id {
+            ui.ctx().memory_mut(|m| m.request_focus(id));
+            self.focus_first_action = false;
+        }
+    }
+
+    /// R3's own row — Check for Update and Quit (Quit here just
+    /// transitions into the existing `quit_confirm` flow above, unchanged
+    /// otherwise). Replaces the old direct-R3-opens-Quit-confirmation
+    /// binding.
+    fn show_menu_zone(&mut self, ui: &mut egui::Ui) {
+        let mut quit = false;
+        let mut first_id = None;
+        let mut row_ids: Vec<egui::Id> = Vec::new();
+        ui.horizontal_wrapped(|ui| {
+            let close = Self::action_badge(self.badge_min_height(), ui, self.icon(ICON_CLOSE));
+            row_ids.push(close.id);
+            if close.clicked() {
+                self.menu_open = false;
+            }
+            ui.strong("Menu");
+            ui.separator();
+            if self.update_check.is_some() {
+                let r = Self::action_badge_disabled(
+                    self.badge_min_height(),
+                    ui,
+                    (self.icon(ICON_SYSTEM_UPDATE), "Checking…"),
+                );
+                row_ids.push(r.id);
+            } else {
+                let r = Self::action_badge(
+                    self.badge_min_height(),
+                    ui,
+                    (self.icon(ICON_SYSTEM_UPDATE), "Check for Update"),
+                );
+                first_id.get_or_insert(r.id);
+                row_ids.push(r.id);
+                if r.clicked() {
+                    self.update_error = None;
+                    self.update_check = Some(update::spawn_check(env!("CARGO_PKG_VERSION")));
+                }
+            }
+            let quit_btn = Self::action_badge(
+                self.badge_min_height(),
+                ui,
+                (self.icon(ICON_LOGOUT), "Quit"),
+            );
+            first_id.get_or_insert(quit_btn.id);
+            row_ids.push(quit_btn.id);
+            if quit_btn.clicked() {
+                quit = true;
+            }
+            if let Some(err) = &self.update_error {
+                ui.separator();
+                ui.colored_label(egui::Color32::RED, err);
+            }
+        });
+        self.right_focus_rows.push(row_ids);
+        if quit {
+            // Deliberately doesn't clear `menu_open` — same "hidden, not
+            // destroyed" relationship Rename/Compress/Permissions already
+            // have with Actions, so canceling out of Quit comes back to
+            // Menu instead of dumping straight to plain browsing.
+            self.quit_confirm = true;
+        }
+        if self.focus_first_action
+            && let Some(id) = first_id
+        {
+            ui.ctx().memory_mut(|m| m.request_focus(id));
+            self.focus_first_action = false;
+        }
+    }
+
+    /// Shown (stacked below Menu) once a Check for Update finds a real,
+    /// newer, published release.
+    fn show_update_available_zone(&mut self, ui: &mut egui::Ui) {
+        let Some(release_version) = self.update_available.as_ref().map(|r| r.version.clone())
+        else {
+            return;
+        };
+        let mut update_now = false;
+        let mut not_now = false;
+        let mut first_id = None;
+        let mut row_ids: Vec<egui::Id> = Vec::new();
+        ui.horizontal_wrapped(|ui| {
+            let close = Self::action_badge(self.badge_min_height(), ui, self.icon(ICON_CLOSE));
+            row_ids.push(close.id);
+            if close.clicked() {
+                not_now = true;
+            }
+            ui.strong("Update");
+            ui.weak(format!("v{release_version} available"));
+            ui.separator();
+            let update_btn = Self::action_badge(
+                self.badge_min_height(),
+                ui,
+                (self.icon(ICON_CLOUD_DOWNLOAD), "Update"),
+            );
+            row_ids.push(update_btn.id);
+            if update_btn.clicked() {
+                update_now = true;
+            }
+            let not_now_btn = Self::action_badge(self.badge_min_height(), ui, "Not now");
+            // Defaults to Not now, not Update — same safety-first
+            // convention as Quit's own Cancel-first default (see
+            // `show_quit_zone`), since this also kicks off a real
+            // download and binary replace.
+            first_id.get_or_insert(not_now_btn.id);
+            row_ids.push(not_now_btn.id);
+            if not_now_btn.clicked() {
+                not_now = true;
+            }
+        });
+        self.right_focus_rows.push(row_ids);
+        if update_now {
+            let release = self.update_available.take().unwrap();
+            let version = release.version.clone();
+            self.update_install = Some((update::spawn_install(release), version));
+        } else if not_now {
+            self.update_available = None;
+        }
+        if self.focus_first_action
+            && let Some(id) = first_id
+        {
+            ui.ctx().memory_mut(|m| m.request_focus(id));
+            self.focus_first_action = false;
+        }
+    }
+
+    /// Persistent restart prompt, shown once `update_install` finishes
+    /// successfully — unlike an ordinary Progress row, this doesn't
+    /// auto-linger/auto-dismiss, since a completed update isn't in effect
+    /// until the app actually restarts.
+    fn show_update_ready_zone(&mut self, ui: &mut egui::Ui) {
+        let Some(version) = self.update_ready.clone() else {
+            return;
+        };
+        let mut restart = false;
+        let mut later = false;
+        let mut first_id = None;
+        let mut row_ids: Vec<egui::Id> = Vec::new();
+        ui.horizontal_wrapped(|ui| {
+            let close = Self::action_badge(self.badge_min_height(), ui, self.icon(ICON_CLOSE));
+            row_ids.push(close.id);
+            if close.clicked() {
+                later = true;
+            }
+            ui.strong("Update Ready");
+            ui.weak(format!("v{version} installed — restart to use it"));
+            ui.separator();
+            let restart_btn = Self::action_badge(
+                self.badge_min_height(),
+                ui,
+                (self.icon(ICON_RESTART_ALT), "Restart Now"),
+            );
+            first_id.get_or_insert(restart_btn.id);
+            row_ids.push(restart_btn.id);
+            if restart_btn.clicked() {
+                restart = true;
+            }
+            let later_btn = Self::action_badge(self.badge_min_height(), ui, "Later");
+            row_ids.push(later_btn.id);
+            if later_btn.clicked() {
+                later = true;
+            }
+        });
+        self.right_focus_rows.push(row_ids);
+        if restart {
+            if let Ok(exe) = std::env::current_exe() {
+                let _ = std::process::Command::new(exe).spawn();
+            }
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if later {
+            self.update_ready = None;
+        }
+        if self.focus_first_action
+            && let Some(id) = first_id
+        {
             ui.ctx().memory_mut(|m| m.request_focus(id));
             self.focus_first_action = false;
         }
@@ -1510,7 +1743,7 @@ impl BrowDeckApp {
             Self::key_badge(ui, "Start");
             ui.label("Open");
             Self::key_badge(ui, "R3");
-            ui.label("Quit");
+            ui.label("Menu");
             Self::key_badge(ui, "Select");
             ui.label("Preview width");
         });
@@ -1660,6 +1893,41 @@ impl eframe::App for BrowDeckApp {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
 
+        if let Some(check) = &self.update_check {
+            if let Some(result) = check.poll() {
+                self.update_check = None;
+                match result {
+                    update::CheckResult::UpToDate => {
+                        self.update_error = Some("You're on the latest version".to_string());
+                    }
+                    update::CheckResult::Available(release) => {
+                        self.update_available = Some(release);
+                    }
+                    update::CheckResult::Error(e) => {
+                        self.update_error = Some(e);
+                    }
+                }
+            } else {
+                ui.ctx().request_repaint_after(Duration::from_millis(200));
+            }
+        }
+        // Taken out of the `Option` (not just polled in place) so a
+        // finished job can be resolved into `update_ready`/`update_error`
+        // without holding a borrow of `self.update_install` across the
+        // assignment — put back unchanged if it's still running.
+        if let Some((mut install, version)) = self.update_install.take() {
+            install.poll();
+            if install.finished {
+                match install.error {
+                    Some(err) => self.update_error = Some(err),
+                    None => self.update_ready = Some(version),
+                }
+            } else {
+                ui.ctx().request_repaint_after(Duration::from_millis(100));
+                self.update_install = Some((install, version));
+            }
+        }
+
         self.enforce_strip_focus_guard(ui.ctx());
         // Only update `current_pane` when a live classification actually
         // succeeds — see its field doc comment for why a `None` here
@@ -1717,8 +1985,8 @@ impl eframe::App for BrowDeckApp {
                     continue;
                 }
                 match action {
-                    gamepad::Action::Quit => {
-                        self.quit_confirm = true;
+                    gamepad::Action::Menu => {
+                        self.menu_open = true;
                         self.focus_first_action = true;
                     }
                     gamepad::Action::Move(dir) => {
@@ -2046,24 +2314,32 @@ impl eframe::App for BrowDeckApp {
         // Whichever of Rename/Compress/Permissions is open (never more
         // than one — see `close_sub_editors`) shares one header above it
         // instead of repeating "the file/folder this row acts on" itself
-        // — only meaningful while Actions itself is actually showing,
-        // and not while Quit has taken over the strip.
-        let show_header = show_actions && !self.quit_confirm;
+        // — only meaningful while Actions itself is actually showing, and
+        // not while Menu/Quit has taken over the strip.
+        let show_header = show_actions && !self.menu_open && !self.quit_confirm;
 
-        // Actions/Rename/Compress/Permissions/Progress are a horizontal
-        // strip along the very bottom, above the status bar, spanning
-        // from the sidebar/main-pane border to the window's right edge
-        // (drawn *after* the sidebar so it naturally excludes that
-        // width, and *before* the right/central panels so they get
-        // whatever's left above it) — not part of the Preview pane.
-        // Rows stack in fixed priority order (Actions, Rename, Compress,
-        // Permissions, Progress), skipping whichever aren't active.
+        // Actions/Rename/Compress/Permissions/Menu/Progress/UpdateReady
+        // are a horizontal strip along the very bottom, above the status
+        // bar, spanning from the sidebar/main-pane border to the window's
+        // right edge (drawn *after* the sidebar so it naturally excludes
+        // that width, and *before* the right/central panels so they get
+        // whatever's left above it) — not part of the Preview pane. Rows
+        // stack in fixed priority order, skipping whichever aren't
+        // active. Menu behaves like a lighter version of Quit's own
+        // exclusivity below — it replaces the Actions family while open
+        // (R3 takes over the strip, same as it always has), but still
+        // lets Progress/the restart prompt show through underneath,
+        // since a background job silently continuing with zero visible
+        // progress would be confusing.
         enum FooterZone {
             Actions,
             Rename,
             Compress,
             Permissions,
+            Menu,
+            UpdateAvailable,
             Progress,
+            UpdateReady,
             Quit,
         }
         let mut active_zones = Vec::new();
@@ -2073,20 +2349,30 @@ impl eframe::App for BrowDeckApp {
             // doesn't lose it.
             active_zones.push(FooterZone::Quit);
         } else {
-            if show_actions {
-                active_zones.push(FooterZone::Actions);
-            }
-            if show_rename {
-                active_zones.push(FooterZone::Rename);
-            }
-            if show_compress {
-                active_zones.push(FooterZone::Compress);
-            }
-            if show_permissions {
-                active_zones.push(FooterZone::Permissions);
+            if self.menu_open {
+                active_zones.push(FooterZone::Menu);
+                if self.update_available.is_some() {
+                    active_zones.push(FooterZone::UpdateAvailable);
+                }
+            } else {
+                if show_actions {
+                    active_zones.push(FooterZone::Actions);
+                }
+                if show_rename {
+                    active_zones.push(FooterZone::Rename);
+                }
+                if show_compress {
+                    active_zones.push(FooterZone::Compress);
+                }
+                if show_permissions {
+                    active_zones.push(FooterZone::Permissions);
+                }
             }
             if show_progress {
                 active_zones.push(FooterZone::Progress);
+            }
+            if self.update_ready.is_some() {
+                active_zones.push(FooterZone::UpdateReady);
             }
         }
         const STATUS_BAR_HEIGHT: f32 = 32.0;
@@ -2182,7 +2468,12 @@ impl eframe::App for BrowDeckApp {
                                     FooterZone::Rename => self.show_rename_editor(ui),
                                     FooterZone::Compress => self.show_compress_editor(ui),
                                     FooterZone::Permissions => self.show_permission_editor(ui),
+                                    FooterZone::Menu => self.show_menu_zone(ui),
+                                    FooterZone::UpdateAvailable => {
+                                        self.show_update_available_zone(ui)
+                                    }
                                     FooterZone::Progress => self.show_progress_zone(ui),
+                                    FooterZone::UpdateReady => self.show_update_ready_zone(ui),
                                     FooterZone::Quit => self.show_quit_zone(ui),
                                 }
                             }
