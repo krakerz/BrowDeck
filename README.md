@@ -16,9 +16,10 @@ default; borderless fullscreen is available via `config.toml`.
 - Full gamepad navigation — d-pad/stick movement stays confined to
   whichever pane (sidebar, file list, actions/preview, toolbar) is
   focused; LB/RB switches between panes
-- Copy, cut, delete (to trash), extract (`.zip`/`.tar`/`.tar.gz`/`.tgz`),
-  rename/new folder, and change permissions (single file or a whole
-  multi-selection), all from a button-driven actions panel
+- Copy, cut, delete (to trash), extract (`.zip`/`.tar`/`.tar.gz`/`.tgz`,
+  plus `.rar` if `unrar` or `7z` is installed), rename/new folder, and
+  change permissions (single file or a whole multi-selection), all from
+  a button-driven actions panel
 - Multi-select for batch operations
 - Sidebar: XDG places, real block-device mounts with USB/microSD
   detection, pinned folders, a trash view with restore/empty, and a
@@ -102,6 +103,15 @@ legend always shows as a reference for the equivalents.
 **Does it follow symlinks?**
 Directory listings and navigation follow symlinks; recursive search
 doesn't descend into symlinked directories, to avoid loops.
+
+**Does it support `.rar`, or password-protected archives?**
+`.rar` extraction works if `unrar` or `7z`/`7za` is installed (BrowDeck
+shells out to it — RAR isn't a format it reads on its own, and the
+official library isn't something to bundle into a GPL project); the
+Extract button greys out with a tooltip if neither is found. Compressing
+*to* `.rar` isn't supported at all. Password-protected archives (`.zip`
+or `.rar`) aren't supported either way — extraction fails with a clear
+"password-protected" message rather than prompting for one.
 
 **How does Check for Update work?**
 Manual only — nothing is checked automatically. R3 → Menu → Check for
