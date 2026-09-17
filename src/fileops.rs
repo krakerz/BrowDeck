@@ -55,6 +55,13 @@ enum ArchiveKind {
     Zip,
     Tar,
     TarGz,
+    /// Extract-only — see `spawn_extract_rar`. Neither the `zip` nor `tar`
+    /// crate reads RAR at all (it's a different format entirely, not just
+    /// a different compression codec), and the official unrar library is
+    /// proprietary — not something to bundle into a GPL project. Shelling
+    /// out to whatever RAR-capable tool the user already has installed
+    /// (`unrar`/`7z`, see `detect_rar_tool`) avoids that entirely.
+    Rar,
 }
 
 fn archive_kind(path: &Path) -> Option<ArchiveKind> {
@@ -65,6 +72,8 @@ fn archive_kind(path: &Path) -> Option<ArchiveKind> {
         Some(ArchiveKind::TarGz)
     } else if name.ends_with(".tar") {
         Some(ArchiveKind::Tar)
+    } else if name.ends_with(".rar") {
+        Some(ArchiveKind::Rar)
     } else {
         None
     }
@@ -72,6 +81,13 @@ fn archive_kind(path: &Path) -> Option<ArchiveKind> {
 
 pub fn is_archive(path: &Path) -> bool {
     archive_kind(path).is_some()
+}
+
+/// Whether `path` is specifically a `.rar` — callers use this to decide
+/// whether `spawn_extract` (native zip/tar) or `spawn_extract_rar`
+/// (external tool, see `detect_rar_tool`) applies.
+pub fn is_rar(path: &Path) -> bool {
+    matches!(archive_kind(path), Some(ArchiveKind::Rar))
 }
 
 pub fn spawn_extract(archive: PathBuf, dest_dir: PathBuf) -> Job {
@@ -93,6 +109,9 @@ fn run_extract(archive_path: &Path, dest_dir: &Path, tx: &Sender<ProgressMsg>) {
         Some(ArchiveKind::Zip) => extract_zip(archive_path, dest_dir, tx),
         Some(ArchiveKind::Tar) => extract_tar(archive_path, dest_dir, tx),
         Some(ArchiveKind::TarGz) => extract_tar_gz(archive_path, dest_dir, tx),
+        // Callers route `.rar` through `spawn_extract_rar` instead —
+        // reachable here only if that dispatch is ever bypassed.
+        Some(ArchiveKind::Rar) => Err("use spawn_extract_rar for .rar archives".to_string()),
         None => Err("unsupported archive format".to_string()),
     };
     match result {
@@ -102,6 +121,17 @@ fn run_extract(archive_path: &Path, dest_dir: &Path, tx: &Sender<ProgressMsg>) {
         Err(e) => {
             let _ = tx.send(ProgressMsg::Error(e));
         }
+    }
+}
+
+/// Friendlier message for the one error case a user can actually do
+/// something about (well, can't, but at least understands why) —
+/// everything else keeps the crate's own message as-is.
+fn zip_extract_error(e: zip::result::ZipError) -> String {
+    if matches!(e, zip::result::ZipError::InvalidPassword) {
+        "archive is password-protected (not supported)".to_string()
+    } else {
+        e.to_string()
     }
 }
 
@@ -115,7 +145,7 @@ fn extract_zip(
     let total = archive.len().max(1) as u64;
     let _ = tx.send(ProgressMsg::Progress { done: 0, total });
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+        let mut entry = archive.by_index(i).map_err(zip_extract_error)?;
         // `enclosed_name` rejects absolute paths and `..` components —
         // skip anything a malicious archive could use to escape dest_dir.
         if let Some(rel_path) = entry.enclosed_name() {
@@ -194,6 +224,100 @@ fn extract_tar_entries<R: Read>(
         });
     }
     Ok(())
+}
+
+/// Finds a RAR-capable command-line tool on `$PATH`, if any — `unrar`
+/// preferred (purpose-built for the format), `7z`/`7za` (p7zip) as a
+/// fallback. Spawning each with no arguments (just enough to prove the
+/// binary exists and runs; the exit code is irrelevant, both print
+/// usage/an error and return promptly either way) rather than parsing
+/// `$PATH` by hand — lets the OS do the actual lookup.
+pub fn detect_rar_tool() -> Option<PathBuf> {
+    ["unrar", "7z", "7za"].into_iter().find_map(|name| {
+        std::process::Command::new(name)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
+            .then(|| PathBuf::from(name))
+    })
+}
+
+/// `.rar` extraction, via whichever tool `detect_rar_tool` found — same
+/// `Job`/`ProgressMsg` shape as `spawn_extract`, but indeterminate
+/// progress throughout (just `0`/`1` until it finishes) since getting
+/// real per-entry progress out of an external process's own stdout would
+/// mean parsing tool- and version-specific output formats.
+pub fn spawn_extract_rar(tool: PathBuf, archive: PathBuf, dest_dir: PathBuf) -> Job {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || run_extract_rar(&tool, &archive, &dest_dir, &tx));
+    Job {
+        label: "Extracting".to_string(),
+        receiver: rx,
+        done: 0,
+        total: 1,
+        finished: false,
+        error: None,
+        finished_at: None,
+    }
+}
+
+fn run_extract_rar(tool: &Path, archive: &Path, dest_dir: &Path, tx: &Sender<ProgressMsg>) {
+    let _ = tx.send(ProgressMsg::Progress { done: 0, total: 1 });
+    match extract_rar_command(tool, archive, dest_dir) {
+        Ok(()) => {
+            let _ = tx.send(ProgressMsg::Done);
+        }
+        Err(e) => {
+            let _ = tx.send(ProgressMsg::Error(e));
+        }
+    }
+}
+
+fn extract_rar_command(tool: &Path, archive: &Path, dest_dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
+    let mut command = std::process::Command::new(tool);
+    match tool.file_name().and_then(|n| n.to_str()) {
+        Some("7z") | Some("7za") => {
+            command
+                .arg("x")
+                .arg("-y")
+                .arg(format!("-o{}", dest_dir.display()))
+                .arg(archive);
+        }
+        // unrar: `x` extracts with full paths, `-y` assumes yes to any
+        // prompt, `-p-` disables the password prompt outright (fails
+        // fast on an encrypted archive instead of however it'd otherwise
+        // behave reading from the closed stdin below).
+        _ => {
+            command
+                .arg("x")
+                .arg("-y")
+                .arg("-p-")
+                .arg(archive)
+                .arg(format!("{}/", dest_dir.display()));
+        }
+    }
+    let output = command
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("couldn't run {}: {e}", tool.display()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let message = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    if message.to_lowercase().contains("password") {
+        Err("archive is password-protected (not supported)".to_string())
+    } else {
+        Err(format!("extract failed: {message}"))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -590,8 +714,58 @@ mod tests {
         assert!(is_archive(Path::new("thing.tar")));
         assert!(is_archive(Path::new("thing.tar.gz")));
         assert!(is_archive(Path::new("thing.TGZ")));
-        assert!(!is_archive(Path::new("thing.rar")));
+        assert!(is_archive(Path::new("thing.rar")));
         assert!(!is_archive(Path::new("thing")));
+    }
+
+    #[test]
+    fn is_rar_matches_only_dot_rar() {
+        assert!(is_rar(Path::new("thing.rar")));
+        assert!(is_rar(Path::new("thing.RAR")));
+        assert!(!is_rar(Path::new("thing.zip")));
+        assert!(!is_rar(Path::new("thing.tar.gz")));
+    }
+
+    #[test]
+    fn zip_extract_error_gives_a_friendly_message_for_invalid_password() {
+        assert_eq!(
+            zip_extract_error(zip::result::ZipError::InvalidPassword),
+            "archive is password-protected (not supported)"
+        );
+    }
+
+    #[test]
+    fn zip_extract_error_passes_other_errors_through_unchanged() {
+        let e = zip::result::ZipError::FileNotFound;
+        assert_eq!(
+            zip_extract_error(zip::result::ZipError::FileNotFound),
+            e.to_string()
+        );
+    }
+
+    #[test]
+    fn extract_rar_command_reports_a_clear_error_for_a_non_rar_file() {
+        // No real .rar fixture to build (no writer available, only
+        // extractors) — probes for whatever tool `detect_rar_tool` would
+        // actually find on this machine and skips loudly if there isn't
+        // one, per this project's own convention for tests that touch
+        // real external state.
+        let Some(tool) = detect_rar_tool() else {
+            eprintln!(
+                "skipping extract_rar_command_reports_a_clear_error_for_a_non_rar_file: \
+                 no RAR-capable tool (unrar/7z/7za) found on PATH"
+            );
+            return;
+        };
+        let root = scratch_dir("rar_not_actually_rar");
+        let fake = root.join("not_really.rar");
+        std::fs::write(&fake, b"this is not a rar archive").unwrap();
+        let dest = root.join("dest");
+
+        let result = extract_rar_command(&tool, &fake, &dest);
+        assert!(result.is_err());
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

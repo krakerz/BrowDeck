@@ -311,6 +311,11 @@ pub struct BrowDeckApp {
     /// The IProLaunch CLI binary, if `~/.config/iprolaunch/bin-path` exists
     /// — detected once at startup, gates the "Add to IProLaunch" action.
     iprolaunch_bin: Option<PathBuf>,
+    /// A RAR-capable command (`unrar`/`7z`/`7za`), if one is on `$PATH` —
+    /// detected once at startup (see `fileops::detect_rar_tool`), gates
+    /// whether a selected `.rar` is actually extractable (BrowDeck can't
+    /// read the format itself — see `fileops::ArchiveKind::Rar`).
+    rar_tool: Option<PathBuf>,
     /// Cached result of the last `iprolaunch::is_registered` check, keyed
     /// by path — `library search` shells out to the CLI, so this is only
     /// recomputed when the selection changes (see `iprolaunch_registered`),
@@ -459,6 +464,7 @@ impl BrowDeckApp {
             recursive_dirty: false,
             recursive_spinner_shown: false,
             iprolaunch_bin: iprolaunch::detect_bin(),
+            rar_tool: fileops::detect_rar_tool(),
             iprolaunch_status: None,
             selected_info: None,
             multi_select: false,
@@ -2993,14 +2999,29 @@ impl BrowDeckApp {
         let single = (paths.len() == 1).then(|| paths[0].clone());
         // Extract works on any number of selected archives at once,
         // mixed formats included — each is its own independent job
-        // (`archive_kind` dispatches per-file), so a non-archive mixed
-        // into a multi-selection is just skipped rather than blocking
-        // the ones that do qualify.
+        // (`archive_kind` dispatches per-file for zip/tar; `.rar` goes
+        // through `fileops::spawn_extract_rar` instead, gated on
+        // `self.rar_tool` since BrowDeck can't read that format itself),
+        // so a non-archive mixed into a multi-selection is just skipped
+        // rather than blocking the ones that do qualify.
         let archive_paths: Vec<PathBuf> = paths
             .iter()
-            .filter(|p| fileops::is_archive(p))
+            .filter(|p| {
+                if fileops::is_rar(p) {
+                    self.rar_tool.is_some()
+                } else {
+                    fileops::is_archive(p)
+                }
+            })
             .cloned()
             .collect();
+        // Only reachable when the selection is all (or partly) `.rar`
+        // and no RAR tool was found — shown as a disabled badge with a
+        // tooltip (same convention as Permissions/IProLaunch) instead of
+        // silently missing, so it's clear *why* Extract isn't there.
+        let rar_tool_missing = archive_paths.is_empty()
+            && !paths.is_empty()
+            && paths.iter().all(|p| fileops::is_archive(p));
         let mut first_id = None;
         let mut row_ids: Vec<egui::Id> = Vec::new();
         ui.horizontal_wrapped(|ui| {
@@ -3162,11 +3183,32 @@ impl BrowDeckApp {
                 if r.clicked() {
                     let dest_dir = self.current_dir.clone();
                     for path in &archive_paths {
-                        self.jobs
-                            .push(fileops::spawn_extract(path.clone(), dest_dir.clone()));
+                        if fileops::is_rar(path) {
+                            if let Some(tool) = self.rar_tool.clone() {
+                                self.jobs.push(fileops::spawn_extract_rar(
+                                    tool,
+                                    path.clone(),
+                                    dest_dir.clone(),
+                                ));
+                            }
+                        } else {
+                            self.jobs
+                                .push(fileops::spawn_extract(path.clone(), dest_dir.clone()));
+                        }
                     }
                     self.context_menu_open = false;
                 }
+            } else if rar_tool_missing && self.jobs.is_empty() {
+                // Not pushed into `row_ids`/`first_id` — a disabled badge
+                // surrenders focus the instant egui draws it (see
+                // NOTES.md "toolbar teleport at min/max zoom"), same
+                // reasoning as the Permissions-without-root badge below.
+                Self::action_badge_disabled(
+                    self.badge_min_height(),
+                    ui,
+                    (self.icon(ICON_UNARCHIVE), "Extract"),
+                )
+                .on_hover_text("Requires unrar or 7z to be installed");
             }
             if !paths.is_empty() && self.jobs.is_empty() {
                 let r = Self::action_badge(

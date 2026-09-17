@@ -1,5 +1,19 @@
 ## [Unreleased]
 
+## [1.9.0] — 2026-09-17
+
+### Added
+- Extract now supports `.rar` archives, via `unrar` or `7z`/`7za` if
+  either is installed — the Extract button greys out with a tooltip if
+  neither is found, since BrowDeck can't read the format on its own
+
+### Fixed
+- A password-protected `.zip` failed with a raw "provided password is
+  incorrect" message even though no password was ever tried — now a
+  clearer "archive is password-protected (not supported)"; a
+  password-protected `.rar` gets the same message instead of hanging or
+  a cryptic tool error
+
 ## [1.8.0] — 2026-09-17
 
 ### Added
