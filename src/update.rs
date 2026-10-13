@@ -1,8 +1,8 @@
-use crate::fileops::{Job, ProgressMsg};
+use crate::fileops::{Job, ProgressMsg, Reporter};
 use serde::Deserialize;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver};
 
 const RELEASES_API_URL: &str = "https://api.github.com/repos/krakerz/BrowDeck/releases/latest";
 /// GitHub's API rejects requests with no `User-Agent` at all.
@@ -112,33 +112,21 @@ fn is_newer(remote: &str, current: &str) -> bool {
 /// shape as `fileops::spawn_extract`/`spawn_compress`) rather than a
 /// parallel progress type.
 pub fn spawn_install(release: ReleaseInfo) -> Job {
-    let (tx, rx) = mpsc::channel();
+    let (job, tx) = Job::new("Updating", None);
     std::thread::spawn(move || run_install(&release, &tx));
-    Job {
-        label: "Updating".to_string(),
-        receiver: rx,
-        done: 0,
-        total: 1,
-        finished: false,
-        error: None,
-        finished_at: None,
-        needs_password: false,
-        retry: None,
-    }
+    job
 }
 
-fn run_install(release: &ReleaseInfo, tx: &Sender<ProgressMsg>) {
+fn run_install(release: &ReleaseInfo, tx: &Reporter) {
     match try_install(release, tx) {
-        Ok(()) => {
-            let _ = tx.send(ProgressMsg::Done);
-        }
-        Err(e) => {
-            let _ = tx.send(ProgressMsg::Error(e));
-        }
+        Ok(()) => tx.send(ProgressMsg::Done),
+        Err(e) => tx.send(ProgressMsg::Error(e)),
     }
 }
 
-fn try_install(release: &ReleaseInfo, tx: &Sender<ProgressMsg>) -> Result<(), String> {
+/// Cancelling is safe at any point: the installed binary is only touched by
+/// the final atomic `rename`, and the temp files are removed on any error.
+fn try_install(release: &ReleaseInfo, tx: &Reporter) -> Result<(), String> {
     let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
     // Both temp files live *next to* the installed binary, not in
     // `std::env::temp_dir()` — the final `rename` over `current_exe` only
@@ -163,7 +151,7 @@ fn try_install(release: &ReleaseInfo, tx: &Sender<ProgressMsg>) -> Result<(), St
     result
 }
 
-fn download(url: &str, dest: &Path, tx: &Sender<ProgressMsg>) -> Result<(), String> {
+fn download(url: &str, dest: &Path, tx: &Reporter) -> Result<(), String> {
     let response = ureq::get(url)
         .header("User-Agent", USER_AGENT)
         .call()
@@ -178,7 +166,7 @@ fn download(url: &str, dest: &Path, tx: &Sender<ProgressMsg>) -> Result<(), Stri
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(1)
         .max(1);
-    let _ = tx.send(ProgressMsg::Progress { done: 0, total });
+    tx.progress(0, total)?;
 
     let mut file = std::fs::File::create(dest).map_err(|e| e.to_string())?;
     let mut reader = response.into_body().into_reader();
@@ -191,10 +179,7 @@ fn download(url: &str, dest: &Path, tx: &Sender<ProgressMsg>) -> Result<(), Stri
         }
         file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
         done += n as u64;
-        let _ = tx.send(ProgressMsg::Progress {
-            done,
-            total: total.max(done),
-        });
+        tx.progress(done, total.max(done))?;
     }
     Ok(())
 }

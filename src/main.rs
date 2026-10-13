@@ -1,4 +1,5 @@
 mod app;
+mod cli;
 mod config;
 mod custom_places;
 mod deleted;
@@ -9,12 +10,15 @@ mod fonts;
 mod gamepad;
 mod iprolaunch;
 mod mounts;
+mod openwith;
 mod permissions;
 mod places;
 mod preview;
+mod thumbnails;
 mod update;
 
 fn main() -> eframe::Result<()> {
+    cli::handle_args();
     let config = config::Config::load();
 
     // `with_inner_size` is set unconditionally, even when requesting

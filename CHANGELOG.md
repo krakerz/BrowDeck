@@ -1,5 +1,35 @@
 ## [Unreleased]
 
+## [1.11.0] — 2026-10-13
+
+### Added
+- Eject for USB drives and SD cards: right-click a drive in the sidebar's
+  Mounts list, or press X on it with a gamepad, then Eject. Unmounts it
+  (no root password needed) and powers the drive off where supported;
+  BrowDeck leaves the drive's folder first if you're browsing it
+- Cancel button on running copy, move, extract, compress, and
+  update-download jobs. A cancelled copy removes its half-written file
+  and a cancelled compress removes its half-written archive; files
+  already finished are kept. With a gamepad, open the Menu (R3) or
+  Actions (X) and press Down to reach it
+- "Open with": pick which installed app opens a file, from the Actions
+  row. Your default app is listed first; Flatpak apps are included and
+  terminal-only apps are left out
+- Image thumbnails in the file list, in place of the generic image icon;
+  they follow the icon-size zoom (LT/RT)
+- R3 Menu has an IProLaunch entry (when IProLaunch is installed) that
+  opens IProLaunch's own window at BrowDeck's window size
+- `--help` and `--version` command-line options
+
+### Changed
+- Gamepad presses are ignored while another app's window (IProLaunch, a
+  game, a viewer) is in front of BrowDeck
+
+### Fixed
+- D-pad presses no longer register twice on Steam Deck in Game Mode:
+  controllers Steam already re-exposes through its virtual gamepad are
+  now skipped, like SDL games do.
+
 ## [1.10.0] — 2026-09-17
 
 ### Added

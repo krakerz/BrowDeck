@@ -20,27 +20,37 @@ default; borderless fullscreen is available via `config.toml`.
   plus `.rar` if `unrar` or `7z` is installed), rename/new folder, and
   change permissions (single file or a whole multi-selection), all from
   a button-driven actions panel
+- Cancel running copy, move, extract, compress, and update-download jobs;
+  a cancelled copy or compress removes its half-written file or archive
+- "Open with" from the Actions row: pick which installed app opens a file
+  (default app listed first; Flatpak apps included, terminal-only apps
+  left out)
 - Multi-select for batch operations
 - Sidebar: XDG places, real block-device mounts with USB/microSD
-  detection, pinned folders, a trash view with restore/empty, and a
-  selection info card (owner/group/size/permissions/link target)
+  detection, pinned folders, a trash view with restore/empty, a
+  selection info card (owner/group/size/permissions/link target), and
+  Eject for USB drives and SD cards (unmounts, then powers the drive off
+  where supported)
 - Pin any folder to the sidebar; unpin from the Actions strip or the
   sidebar itself
 - Sort the file list by name, size, or modified date, ascending or
   descending
 - Mimetype-aware file icons (archives, images, audio, video, PDFs, code,
   fonts, …)
+- Image thumbnails in the file list, following the icon-size zoom
 - Quick preview pane for images and text files
 - Show/hide hidden files toggle (hidden by default)
 - In-folder search, with an optional recursive (subfolder) mode
 - Material Design icons; LT/RT adjusts the scale of the sidebar and main
   pane specifically
 - CJK (Japanese/Chinese/Korean) filename rendering
-- R3 opens a Menu (Quit, with a confirmation step, and Check for Update)
+- R3 opens a Menu (Quit, with a confirmation step; Check for Update; and
+  IProLaunch, when installed, which opens its window at BrowDeck's size)
 - Check for Update looks up the latest published GitHub release and, if
   it's newer, downloads and installs it in place (prompts a restart)
 - Optional IProLaunch integration — an "Add to IProLaunch" action for
   `.exe`/`.bat` files when IProLaunch is installed
+- Command-line options: `--help` and `--version`
 
 ## Installation
 
@@ -81,13 +91,25 @@ Navigate with the d-pad or left stick; the right stick moves the selection
 | Y (tap)   | Refresh the active pane                     |
 | Y (hold)  | Search                                      |
 | L3        | Toggle multi-select                         |
-| R3        | Menu (Check for Update, Quit)                |
+| R3        | Menu (Check for Update, IProLaunch, Quit)    |
 | Start     | Open the selected item                      |
 | Select    | Toggle preview pane width                   |
 | LB / RB   | Switch pane (Sidebar / main list / Preview / Toolbar) |
 | LT / RT   | Icon scale down / up                        |
 
 Everything is also reachable with a mouse and keyboard.
+
+To eject a USB drive or SD card, right-click it in the sidebar's Mounts
+list, or press X on it with a gamepad and choose Eject. To cancel a
+running copy, move, extract, compress, or update download, open the Menu
+(R3) or Actions (X) and press Down to reach Cancel.
+
+### Command line
+
+```sh
+browdeck --help      # list command-line options
+browdeck --version   # print the installed version
+```
 
 ## FAQ
 

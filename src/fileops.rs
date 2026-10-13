@@ -1,7 +1,12 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// The error string a worker finishes with when the user cancelled it.
+pub const CANCELLED: &str = "cancelled";
 
 pub enum ProgressMsg {
     Progress {
@@ -46,9 +51,74 @@ pub struct Job {
     /// `None` for every job that isn't an archive extraction (copy/
     /// move/compress/update-install).
     pub retry: Option<ExtractRetry>,
+    /// False for work that can't stop partway (e.g. an unmount), so the UI
+    /// doesn't offer a Cancel that would do nothing.
+    pub cancellable: bool,
+    cancel: Arc<AtomicBool>,
+}
+
+/// Worker-side end of a `Job`: the progress channel plus the cancel flag
+/// the UI sets.
+pub struct Reporter {
+    tx: Sender<ProgressMsg>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Reporter {
+    pub fn send(&self, msg: ProgressMsg) {
+        let _ = self.tx.send(msg);
+    }
+
+    /// Reports progress, or returns `Err(CANCELLED)` once the user has
+    /// cancelled — every worker loop calls this, so it doubles as the
+    /// cancellation check.
+    pub fn progress(&self, done: u64, total: u64) -> Result<(), String> {
+        if self.is_cancelled() {
+            return Err(CANCELLED.to_string());
+        }
+        self.send(ProgressMsg::Progress { done, total });
+        Ok(())
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
 }
 
 impl Job {
+    pub fn new(label: &str, retry: Option<ExtractRetry>) -> (Job, Reporter) {
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let job = Job {
+            label: label.to_string(),
+            receiver: rx,
+            done: 0,
+            total: 1,
+            finished: false,
+            error: None,
+            finished_at: None,
+            needs_password: false,
+            retry,
+            cancellable: true,
+            cancel: cancel.clone(),
+        };
+        (job, Reporter { tx, cancel })
+    }
+
+    /// Asks the worker to stop; it finishes with `Error(CANCELLED)` at its
+    /// next progress step.
+    pub fn request_cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    pub fn cancel_requested(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    pub fn was_cancelled(&self) -> bool {
+        self.error.as_deref() == Some(CANCELLED)
+    }
+
     /// Drains all pending progress messages, keeping only the latest state.
     pub fn poll(&mut self) {
         while let Ok(msg) = self.receiver.try_recv() {
@@ -134,6 +204,12 @@ enum ExtractFailure {
     Error(String),
 }
 
+impl From<String> for ExtractFailure {
+    fn from(e: String) -> Self {
+        ExtractFailure::Error(e)
+    }
+}
+
 impl From<std::io::Error> for ExtractFailure {
     fn from(e: std::io::Error) -> Self {
         ExtractFailure::Error(e.to_string())
@@ -172,32 +248,17 @@ pub fn spawn_extract_with_password(archive: PathBuf, dest_dir: PathBuf, password
 }
 
 fn spawn_extract_impl(archive: PathBuf, dest_dir: PathBuf, password: Option<String>) -> Job {
-    let (tx, rx) = mpsc::channel();
     let retry = ExtractRetry {
         archive: archive.clone(),
         dest_dir: dest_dir.clone(),
         rar_tool: None,
     };
+    let (job, tx) = Job::new("Extracting", Some(retry));
     std::thread::spawn(move || run_extract(&archive, &dest_dir, password.as_deref(), &tx));
-    Job {
-        label: "Extracting".to_string(),
-        receiver: rx,
-        done: 0,
-        total: 1,
-        finished: false,
-        error: None,
-        finished_at: None,
-        needs_password: false,
-        retry: Some(retry),
-    }
+    job
 }
 
-fn run_extract(
-    archive_path: &Path,
-    dest_dir: &Path,
-    password: Option<&str>,
-    tx: &Sender<ProgressMsg>,
-) {
+fn run_extract(archive_path: &Path, dest_dir: &Path, password: Option<&str>, tx: &Reporter) {
     let result: Result<(), ExtractFailure> = match archive_kind(archive_path) {
         Some(ArchiveKind::Zip) => extract_zip(archive_path, dest_dir, password, tx),
         Some(ArchiveKind::Tar) => {
@@ -217,13 +278,13 @@ fn run_extract(
     };
     match result {
         Ok(()) => {
-            let _ = tx.send(ProgressMsg::Done);
+            tx.send(ProgressMsg::Done);
         }
         Err(ExtractFailure::PasswordRequired) => {
-            let _ = tx.send(ProgressMsg::PasswordRequired);
+            tx.send(ProgressMsg::PasswordRequired);
         }
         Err(ExtractFailure::Error(e)) => {
-            let _ = tx.send(ProgressMsg::Error(e));
+            tx.send(ProgressMsg::Error(e));
         }
     }
 }
@@ -232,12 +293,12 @@ fn extract_zip(
     archive_path: &Path,
     dest_dir: &Path,
     password: Option<&str>,
-    tx: &Sender<ProgressMsg>,
+    tx: &Reporter,
 ) -> Result<(), ExtractFailure> {
     let file = std::fs::File::open(archive_path)?;
     let mut archive = zip::ZipArchive::new(file)?;
     let total = archive.len().max(1) as u64;
-    let _ = tx.send(ProgressMsg::Progress { done: 0, total });
+    tx.progress(0, total)?;
     for i in 0..archive.len() {
         let mut entry = match password {
             Some(pw) => archive.by_index_decrypt(i, pw.as_bytes())?,
@@ -257,10 +318,7 @@ fn extract_zip(
                 std::io::copy(&mut entry, &mut out_file)?;
             }
         }
-        let _ = tx.send(ProgressMsg::Progress {
-            done: (i + 1) as u64,
-            total,
-        });
+        tx.progress((i + 1) as u64, total)?;
     }
     Ok(())
 }
@@ -269,26 +327,18 @@ fn extract_zip(
 /// cheap way to know the entry count up front — this does a first pass
 /// (decompressing but not writing) purely to count entries for progress,
 /// then a second pass that actually extracts.
-fn extract_tar(
-    archive_path: &Path,
-    dest_dir: &Path,
-    tx: &Sender<ProgressMsg>,
-) -> Result<(), String> {
+fn extract_tar(archive_path: &Path, dest_dir: &Path, tx: &Reporter) -> Result<(), String> {
     let count_file = std::fs::File::open(archive_path).map_err(|e| e.to_string())?;
     let total = count_tar_entries(count_file)?.max(1);
-    let _ = tx.send(ProgressMsg::Progress { done: 0, total });
+    tx.progress(0, total)?;
     let file = std::fs::File::open(archive_path).map_err(|e| e.to_string())?;
     extract_tar_entries(file, dest_dir, total, tx)
 }
 
-fn extract_tar_gz(
-    archive_path: &Path,
-    dest_dir: &Path,
-    tx: &Sender<ProgressMsg>,
-) -> Result<(), String> {
+fn extract_tar_gz(archive_path: &Path, dest_dir: &Path, tx: &Reporter) -> Result<(), String> {
     let count_file = std::fs::File::open(archive_path).map_err(|e| e.to_string())?;
     let total = count_tar_entries(flate2::read::GzDecoder::new(count_file))?.max(1);
-    let _ = tx.send(ProgressMsg::Progress { done: 0, total });
+    tx.progress(0, total)?;
     let file = std::fs::File::open(archive_path).map_err(|e| e.to_string())?;
     extract_tar_entries(flate2::read::GzDecoder::new(file), dest_dir, total, tx)
 }
@@ -307,7 +357,7 @@ fn extract_tar_entries<R: Read>(
     reader: R,
     dest_dir: &Path,
     total: u64,
-    tx: &Sender<ProgressMsg>,
+    tx: &Reporter,
 ) -> Result<(), String> {
     let mut archive = tar::Archive::new(reader);
     for (i, entry) in archive.entries().map_err(|e| e.to_string())?.enumerate() {
@@ -315,10 +365,7 @@ fn extract_tar_entries<R: Read>(
         // `unpack_in` (not `unpack`) is the sanitizing variant — refuses to
         // write outside `dest_dir` (path traversal / absolute paths).
         entry.unpack_in(dest_dir).map_err(|e| e.to_string())?;
-        let _ = tx.send(ProgressMsg::Progress {
-            done: (i + 1) as u64,
-            total,
-        });
+        tx.progress((i + 1) as u64, total)?;
     }
     Ok(())
 }
@@ -367,26 +414,16 @@ fn spawn_extract_rar_impl(
     dest_dir: PathBuf,
     password: Option<String>,
 ) -> Job {
-    let (tx, rx) = mpsc::channel();
     let retry = ExtractRetry {
         archive: archive.clone(),
         dest_dir: dest_dir.clone(),
         rar_tool: Some(tool.clone()),
     };
+    let (job, tx) = Job::new("Extracting", Some(retry));
     std::thread::spawn(move || {
         run_extract_rar(&tool, &archive, &dest_dir, password.as_deref(), &tx)
     });
-    Job {
-        label: "Extracting".to_string(),
-        receiver: rx,
-        done: 0,
-        total: 1,
-        finished: false,
-        error: None,
-        finished_at: None,
-        needs_password: false,
-        retry: Some(retry),
-    }
+    job
 }
 
 fn run_extract_rar(
@@ -394,18 +431,18 @@ fn run_extract_rar(
     archive: &Path,
     dest_dir: &Path,
     password: Option<&str>,
-    tx: &Sender<ProgressMsg>,
+    tx: &Reporter,
 ) {
-    let _ = tx.send(ProgressMsg::Progress { done: 0, total: 1 });
-    match extract_rar_command(tool, archive, dest_dir, password) {
+    tx.send(ProgressMsg::Progress { done: 0, total: 1 });
+    match extract_rar_command(tool, archive, dest_dir, password, || tx.is_cancelled()) {
         Ok(()) => {
-            let _ = tx.send(ProgressMsg::Done);
+            tx.send(ProgressMsg::Done);
         }
         Err(ExtractFailure::PasswordRequired) => {
-            let _ = tx.send(ProgressMsg::PasswordRequired);
+            tx.send(ProgressMsg::PasswordRequired);
         }
         Err(ExtractFailure::Error(e)) => {
-            let _ = tx.send(ProgressMsg::Error(e));
+            tx.send(ProgressMsg::Error(e));
         }
     }
 }
@@ -415,6 +452,7 @@ fn extract_rar_command(
     archive: &Path,
     dest_dir: &Path,
     password: Option<&str>,
+    cancelled: impl Fn() -> bool,
 ) -> Result<(), ExtractFailure> {
     std::fs::create_dir_all(dest_dir).map_err(|e| ExtractFailure::Error(e.to_string()))?;
     let mut command = std::process::Command::new(tool);
@@ -441,15 +479,34 @@ fn extract_rar_command(
             command.arg(archive).arg(format!("{}/", dest_dir.display()));
         }
     }
-    let output = command
+    let mut child = command
         .stdin(std::process::Stdio::null())
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| ExtractFailure::Error(format!("couldn't run {}: {e}", tool.display())))?;
-    if output.status.success() {
+    // Drained on their own threads: the tool prints a line per entry, and a
+    // full pipe would block it forever while this thread waits on it.
+    let stdout_reader = drain_pipe(child.stdout.take());
+    let stderr_reader = drain_pipe(child.stderr.take());
+    let status = loop {
+        if cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ExtractFailure::Error(CANCELLED.to_string()));
+        }
+        match child.try_wait()? {
+            Some(status) => break status,
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    if status.success() {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&stderr);
+    let stdout = String::from_utf8_lossy(&stdout);
     let message = if stderr.trim().is_empty() {
         stdout.trim()
     } else {
@@ -462,6 +519,16 @@ fn extract_rar_command(
     }
 }
 
+fn drain_pipe<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    })
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CompressKind {
     Zip,
@@ -469,32 +536,23 @@ pub enum CompressKind {
 }
 
 pub fn spawn_compress(sources: Vec<PathBuf>, dest: PathBuf, kind: CompressKind) -> Job {
-    let (tx, rx) = mpsc::channel();
+    let (job, tx) = Job::new("Compressing", None);
     std::thread::spawn(move || run_compress(&sources, &dest, kind, &tx));
-    Job {
-        label: "Compressing".to_string(),
-        receiver: rx,
-        done: 0,
-        total: 1,
-        finished: false,
-        error: None,
-        finished_at: None,
-        needs_password: false,
-        retry: None,
-    }
+    job
 }
 
-fn run_compress(sources: &[PathBuf], dest: &Path, kind: CompressKind, tx: &Sender<ProgressMsg>) {
+fn run_compress(sources: &[PathBuf], dest: &Path, kind: CompressKind, tx: &Reporter) {
     let result = match kind {
         CompressKind::Zip => compress_zip(sources, dest, tx),
         CompressKind::TarGz => compress_tar_gz(sources, dest, tx),
     };
     match result {
-        Ok(()) => {
-            let _ = tx.send(ProgressMsg::Done);
-        }
+        Ok(()) => tx.send(ProgressMsg::Done),
         Err(e) => {
-            let _ = tx.send(ProgressMsg::Error(e));
+            if e == CANCELLED {
+                let _ = std::fs::remove_file(dest);
+            }
+            tx.send(ProgressMsg::Error(e));
         }
     }
 }
@@ -517,13 +575,13 @@ fn walk_count(path: &Path, count: &mut u64) {
     }
 }
 
-fn compress_zip(sources: &[PathBuf], dest: &Path, tx: &Sender<ProgressMsg>) -> Result<(), String> {
+fn compress_zip(sources: &[PathBuf], dest: &Path, tx: &Reporter) -> Result<(), String> {
     let mut total = 0u64;
     for src in sources {
         walk_count(src, &mut total);
     }
     let total = total.max(1);
-    let _ = tx.send(ProgressMsg::Progress { done: 0, total });
+    tx.progress(0, total)?;
 
     let file = std::fs::File::create(dest).map_err(|e| e.to_string())?;
     let mut zip = zip::ZipWriter::new(file);
@@ -554,14 +612,14 @@ fn add_to_zip(
     options: zip::write::SimpleFileOptions,
     done: &mut u64,
     total: u64,
-    tx: &Sender<ProgressMsg>,
+    tx: &Reporter,
 ) -> Result<(), String> {
     let meta = std::fs::symlink_metadata(src).map_err(|e| e.to_string())?;
     if meta.is_dir() {
         zip.add_directory(format!("{}/", rel_name.to_string_lossy()), options)
             .map_err(|e| e.to_string())?;
         *done += 1;
-        let _ = tx.send(ProgressMsg::Progress { done: *done, total });
+        tx.progress(*done, total)?;
         for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
             let child_rel = rel_name.join(entry.file_name());
@@ -573,22 +631,18 @@ fn add_to_zip(
         let mut f = std::fs::File::open(src).map_err(|e| e.to_string())?;
         std::io::copy(&mut f, zip).map_err(|e| e.to_string())?;
         *done += 1;
-        let _ = tx.send(ProgressMsg::Progress { done: *done, total });
+        tx.progress(*done, total)?;
     }
     Ok(())
 }
 
-fn compress_tar_gz(
-    sources: &[PathBuf],
-    dest: &Path,
-    tx: &Sender<ProgressMsg>,
-) -> Result<(), String> {
+fn compress_tar_gz(sources: &[PathBuf], dest: &Path, tx: &Reporter) -> Result<(), String> {
     let mut total = 0u64;
     for src in sources {
         walk_count(src, &mut total);
     }
     let total = total.max(1);
-    let _ = tx.send(ProgressMsg::Progress { done: 0, total });
+    tx.progress(0, total)?;
 
     let file = std::fs::File::create(dest).map_err(|e| e.to_string())?;
     let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
@@ -611,7 +665,7 @@ fn add_to_tar<W: Write>(
     rel_name: &Path,
     done: &mut u64,
     total: u64,
-    tx: &Sender<ProgressMsg>,
+    tx: &Reporter,
 ) -> Result<(), String> {
     let meta = std::fs::symlink_metadata(src).map_err(|e| e.to_string())?;
     if meta.is_dir() {
@@ -619,7 +673,7 @@ fn add_to_tar<W: Write>(
             .append_dir(rel_name, src)
             .map_err(|e| e.to_string())?;
         *done += 1;
-        let _ = tx.send(ProgressMsg::Progress { done: *done, total });
+        tx.progress(*done, total)?;
         for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
             let child_rel = rel_name.join(entry.file_name());
@@ -631,28 +685,18 @@ fn add_to_tar<W: Write>(
             .append_file(rel_name, &mut f)
             .map_err(|e| e.to_string())?;
         *done += 1;
-        let _ = tx.send(ProgressMsg::Progress { done: *done, total });
+        tx.progress(*done, total)?;
     }
     Ok(())
 }
 
 fn spawn_job(label: &str, sources: Vec<PathBuf>, dest_dir: PathBuf, is_move: bool) -> Job {
-    let (tx, rx) = mpsc::channel();
+    let (job, tx) = Job::new(label, None);
     std::thread::spawn(move || run_job(&sources, &dest_dir, is_move, &tx));
-    Job {
-        label: label.to_string(),
-        receiver: rx,
-        done: 0,
-        total: 1,
-        finished: false,
-        error: None,
-        finished_at: None,
-        needs_password: false,
-        retry: None,
-    }
+    job
 }
 
-fn run_job(sources: &[PathBuf], dest_dir: &Path, is_move: bool, tx: &Sender<ProgressMsg>) {
+fn run_job(sources: &[PathBuf], dest_dir: &Path, is_move: bool, tx: &Reporter) {
     let total = sources.iter().map(|s| size_of(s)).sum::<u64>().max(1);
     let mut done = 0u64;
     for src in sources {
@@ -666,11 +710,11 @@ fn run_job(sources: &[PathBuf], dest_dir: &Path, is_move: bool, tx: &Sender<Prog
             copy_one(src, &dest, &mut done, total, tx)
         };
         if let Err(e) = result {
-            let _ = tx.send(ProgressMsg::Error(e));
+            tx.send(ProgressMsg::Error(e));
             return;
         }
     }
-    let _ = tx.send(ProgressMsg::Done);
+    tx.send(ProgressMsg::Done);
 }
 
 fn size_of(path: &Path) -> u64 {
@@ -699,7 +743,7 @@ fn copy_one(
     dest: &Path,
     done: &mut u64,
     total: u64,
-    tx: &Sender<ProgressMsg>,
+    tx: &Reporter,
 ) -> Result<(), String> {
     let meta = std::fs::symlink_metadata(src).map_err(|e| e.to_string())?;
     if meta.is_dir() {
@@ -725,7 +769,7 @@ fn copy_file(
     dest: &Path,
     done: &mut u64,
     total: u64,
-    tx: &Sender<ProgressMsg>,
+    tx: &Reporter,
 ) -> Result<(), String> {
     let mut reader = std::fs::File::open(src).map_err(|e| e.to_string())?;
     let mut writer = std::fs::File::create(dest).map_err(|e| e.to_string())?;
@@ -737,7 +781,11 @@ fn copy_file(
         }
         writer.write_all(&buf[..n]).map_err(|e| e.to_string())?;
         *done += n as u64;
-        let _ = tx.send(ProgressMsg::Progress { done: *done, total });
+        if let Err(e) = tx.progress(*done, total) {
+            drop(writer);
+            let _ = std::fs::remove_file(dest);
+            return Err(e);
+        }
     }
     Ok(())
 }
@@ -750,12 +798,11 @@ fn move_one(
     item_size: u64,
     done: &mut u64,
     total: u64,
-    tx: &Sender<ProgressMsg>,
+    tx: &Reporter,
 ) -> Result<(), String> {
     if std::fs::rename(src, dest).is_ok() {
         *done += item_size;
-        let _ = tx.send(ProgressMsg::Progress { done: *done, total });
-        return Ok(());
+        return tx.progress(*done, total);
     }
     copy_one(src, dest, done, total, tx)?;
     remove_path(src)
@@ -803,6 +850,44 @@ mod tests {
                 ProgressMsg::PasswordRequired => return Err("password required".to_string()),
             }
         }
+    }
+
+    #[test]
+    fn cancelled_copy_reports_cancelled_and_removes_the_partial_file() {
+        let root = scratch_dir("cancel_copy");
+        let src = root.join("big.bin");
+        std::fs::write(&src, vec![7u8; 1024 * 1024]).unwrap();
+        let dest_dir = root.join("dest");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+
+        let (mut job, tx) = Job::new("Copying", None);
+        job.request_cancel();
+        run_job(std::slice::from_ref(&src), &dest_dir, false, &tx);
+
+        assert_eq!(wait_done(&job.receiver), Err(CANCELLED.to_string()));
+        assert!(!dest_dir.join("big.bin").exists());
+        assert!(src.exists());
+        job.error = Some(CANCELLED.to_string());
+        assert!(job.was_cancelled());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn cancelled_compress_leaves_no_archive_behind() {
+        let root = scratch_dir("cancel_compress");
+        let src = root.join("a.txt");
+        std::fs::write(&src, b"hello").unwrap();
+        let archive = root.join("out.zip");
+
+        let (job, tx) = Job::new("Compressing", None);
+        job.request_cancel();
+        run_compress(std::slice::from_ref(&src), &archive, CompressKind::Zip, &tx);
+
+        assert_eq!(wait_done(&job.receiver), Err(CANCELLED.to_string()));
+        assert!(!archive.exists());
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -924,7 +1009,7 @@ mod tests {
         std::fs::write(&fake, b"this is not a rar archive").unwrap();
         let dest = root.join("dest");
 
-        let result = extract_rar_command(&tool, &fake, &dest, None);
+        let result = extract_rar_command(&tool, &fake, &dest, None, || false);
         assert!(result.is_err());
 
         std::fs::remove_dir_all(&root).unwrap();

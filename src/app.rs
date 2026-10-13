@@ -1,17 +1,17 @@
 use crate::{
     custom_places, deleted, fileicons, fileinfo, fileops, fonts, gamepad, iprolaunch, mounts,
-    permissions, places, preview, update,
+    openwith, permissions, places, preview, thumbnails, update,
 };
 use egui_material_icons::MaterialIcon;
 use egui_material_icons::icons::{
     ICON_ACCOUNT_TREE, ICON_ARCHIVE, ICON_ARROW_DOWNWARD, ICON_ARROW_UPWARD, ICON_BOOKMARK,
     ICON_CHECK_CIRCLE, ICON_CLOSE, ICON_CLOUD_DOWNLOAD, ICON_CONTENT_COPY, ICON_CONTENT_CUT,
     ICON_CONTENT_PASTE, ICON_CREATE_NEW_FOLDER, ICON_DELETE, ICON_DELETE_SWEEP,
-    ICON_DRIVE_FILE_RENAME_OUTLINE, ICON_FOLDER_ZIP, ICON_GAMEPAD, ICON_KEEP, ICON_KEEP_OFF,
-    ICON_LOCK, ICON_LOGOUT, ICON_MENU, ICON_OPEN_IN_NEW, ICON_PREVIEW, ICON_PRIORITY_HIGH,
-    ICON_REFRESH, ICON_RESTART_ALT, ICON_RESTORE_FROM_TRASH, ICON_ROCKET_LAUNCH, ICON_SEARCH,
-    ICON_SORT, ICON_SYSTEM_UPDATE, ICON_UNARCHIVE, ICON_VISIBILITY, ICON_VISIBILITY_OFF,
-    ICON_ZOOM_IN, ICON_ZOOM_OUT,
+    ICON_DRIVE_FILE_RENAME_OUTLINE, ICON_EJECT, ICON_FOLDER_ZIP, ICON_GAMEPAD, ICON_KEEP,
+    ICON_KEEP_OFF, ICON_LOCK, ICON_LOGOUT, ICON_MENU, ICON_OPEN_IN_NEW, ICON_OPEN_WITH,
+    ICON_PREVIEW, ICON_PRIORITY_HIGH, ICON_REFRESH, ICON_RESTART_ALT, ICON_RESTORE_FROM_TRASH,
+    ICON_ROCKET_LAUNCH, ICON_SEARCH, ICON_SORT, ICON_SYSTEM_UPDATE, ICON_UNARCHIVE,
+    ICON_VISIBILITY, ICON_VISIBILITY_OFF, ICON_ZOOM_IN, ICON_ZOOM_OUT,
 };
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -206,10 +206,13 @@ pub struct BrowDeckApp {
     /// Cached text-preview content, keyed by path so it's only re-read from
     /// disk when the selection actually changes, not every frame.
     preview_text: Option<(PathBuf, String)>,
+    thumbnails: thumbnails::Thumbnails,
     context_menu_open: bool,
     perm_editor: Option<PermEditor>,
     rename_editor: Option<RenameEditor>,
     compress_editor: Option<CompressEditor>,
+    /// The file and its candidate apps, while the Open with row is open.
+    open_with: Option<(PathBuf, Vec<openwith::App>)>,
     /// True while the Rename/New Folder name field has *real* keyboard
     /// focus (not just d-pad selection) — while set, the field renders as
     /// an actual `TextEdit` and gamepad d-pad/left-stick input is
@@ -280,6 +283,11 @@ pub struct BrowDeckApp {
     /// (for the Actions strip's Unpin badge) without navigating into it,
     /// mirroring `select_focused_entry` for the file list.
     sidebar_custom_place_ids: Vec<(egui::Id, PathBuf)>,
+    /// Last frame's ejectable mount rows, so ContextMenu on a focused one
+    /// can open the Eject row.
+    sidebar_mount_ids: Vec<(egui::Id, mounts::Mount)>,
+    /// The mount the Eject row is asking about, while it's open.
+    eject_target: Option<mounts::Mount>,
     /// Ids of last frame's toolbar buttons, in visual left-to-right order —
     /// confines d-pad/stick movement to the Toolbar pane.
     toolbar_ids: Vec<egui::Id>,
@@ -451,10 +459,12 @@ impl BrowDeckApp {
             preview_enabled: false,
             preview_wide: false,
             preview_text: None,
+            thumbnails: thumbnails::Thumbnails::new(&cc.egui_ctx),
             context_menu_open: false,
             perm_editor: None,
             rename_editor: None,
             compress_editor: None,
+            open_with: None,
             rename_editing: false,
             rename_focus_pending: false,
             compress_editing: false,
@@ -480,6 +490,8 @@ impl BrowDeckApp {
             trash_ids: Vec::new(),
             sidebar_ids: Vec::new(),
             sidebar_custom_place_ids: Vec::new(),
+            sidebar_mount_ids: Vec::new(),
+            eject_target: None,
             toolbar_ids: Vec::new(),
             right_focus_rows: Vec::new(),
             sidebar_last_focus: None,
@@ -596,6 +608,7 @@ impl BrowDeckApp {
     fn navigate_to(&mut self, dir: PathBuf) {
         self.current_dir = dir;
         self.view = View::Dir;
+        self.thumbnails.clear();
         self.search_query.clear();
         self.recursive_results.clear();
         self.recursive_dirty = false;
@@ -796,6 +809,8 @@ impl BrowDeckApp {
             {
                 self.focus_first_action = true;
             }
+        } else if self.eject_target.is_some() {
+            self.eject_target = None;
         } else if self.multi_select {
             self.multi_select = false;
             self.multi_selected.clear();
@@ -816,6 +831,11 @@ impl BrowDeckApp {
             // `rename_editor`'s branch above for why.)
             self.compress_editor = None;
             self.compress_editing = false;
+            if self.context_menu_open {
+                self.focus_first_action = true;
+            }
+        } else if self.open_with.is_some() {
+            self.open_with = None;
             if self.context_menu_open {
                 self.focus_first_action = true;
             }
@@ -934,6 +954,7 @@ impl BrowDeckApp {
             || self.update_available.is_some()
             || self.update_ready.is_some()
             || self.password_prompt.is_some()
+            || self.eject_target.is_some()
             || self.quit_confirm;
         if guard_active && !self.focus_inside_strip(ctx) {
             // Re-primes the same "focus this row's own first widget next
@@ -984,6 +1005,7 @@ impl BrowDeckApp {
             || self.update_available.is_some()
             || self.update_ready.is_some()
             || self.password_prompt.is_some()
+            || self.eject_target.is_some()
             || self.quit_confirm;
         if guard_active {
             let inside = self.focus_inside_strip(ctx);
@@ -1135,6 +1157,7 @@ impl BrowDeckApp {
             || self.update_available.is_some()
             || self.update_ready.is_some()
             || self.password_prompt.is_some()
+            || self.eject_target.is_some()
             || self.quit_confirm
         {
             return;
@@ -1553,6 +1576,123 @@ impl BrowDeckApp {
         }
     }
 
+    fn show_open_with_zone(&mut self, ui: &mut egui::Ui) {
+        let Some((path, apps)) = self.open_with.clone() else {
+            return;
+        };
+        let min_height = self.badge_min_height();
+        let mut chosen = None;
+        let mut close = false;
+        let mut first_id = None;
+        let mut row_ids: Vec<egui::Id> = Vec::new();
+        ui.horizontal_wrapped(|ui| {
+            let close_btn = Self::action_badge(min_height, ui, self.icon(ICON_CLOSE));
+            row_ids.push(close_btn.id);
+            if close_btn.clicked() {
+                close = true;
+            }
+            ui.strong("Open with");
+            ui.separator();
+            if apps.is_empty() {
+                ui.weak("No installed app handles this file type");
+            }
+            for app in &apps {
+                let r =
+                    Self::action_badge(min_height, ui, app.name.as_str()).on_hover_text(&app.id);
+                first_id.get_or_insert(r.id);
+                row_ids.push(r.id);
+                if r.clicked() {
+                    chosen = Some(app.clone());
+                }
+            }
+            first_id.get_or_insert(close_btn.id);
+        });
+        self.right_focus_rows.push(row_ids);
+        if let Some(app) = chosen {
+            if let Err(e) = openwith::launch(&app, &path) {
+                eprintln!("open with {} failed: {e}", app.id);
+            }
+            self.open_with = None;
+            self.context_menu_open = false;
+        } else if close {
+            self.open_with = None;
+            if self.context_menu_open {
+                self.focus_first_action = true;
+            }
+        }
+        if self.focus_first_action
+            && self.open_with.is_some()
+            && let Some(id) = first_id
+        {
+            ui.ctx().memory_mut(|m| m.request_focus(id));
+            self.focus_first_action = false;
+        }
+    }
+
+    fn open_eject(&mut self, mount: mounts::Mount) {
+        self.context_menu_open = false;
+        self.close_sub_editors();
+        self.eject_target = Some(mount);
+        self.focus_first_action = true;
+    }
+
+    fn show_eject_zone(&mut self, ui: &mut egui::Ui) {
+        let Some(mount) = self.eject_target.clone() else {
+            return;
+        };
+        let focus_pending_at_start = self.focus_first_action;
+        let min_height = self.badge_min_height();
+        let busy = !self.jobs.is_empty();
+        let mut confirm = false;
+        let mut close = false;
+        let mut first_id = None;
+        let mut row_ids: Vec<egui::Id> = Vec::new();
+        ui.horizontal_wrapped(|ui| {
+            let close_btn = Self::action_badge(min_height, ui, self.icon(ICON_CLOSE));
+            row_ids.push(close_btn.id);
+            if close_btn.clicked() {
+                close = true;
+            }
+            ui.strong("Eject");
+            ui.separator();
+            ui.label(mount.mount_point.to_string_lossy());
+            if busy {
+                // Not pushed into `row_ids`: a disabled widget gives up
+                // focus the moment it's drawn.
+                Self::action_badge_disabled(min_height, ui, (self.icon(ICON_EJECT), "Eject"))
+                    .on_disabled_hover_text("Wait for the running job to finish");
+            } else {
+                let eject_btn =
+                    Self::action_badge(min_height, ui, (self.icon(ICON_EJECT), "Eject"));
+                first_id = Some(eject_btn.id);
+                row_ids.push(eject_btn.id);
+                if eject_btn.clicked() {
+                    confirm = true;
+                }
+            }
+            first_id.get_or_insert(close_btn.id);
+        });
+        self.right_focus_rows.push(row_ids);
+        if confirm {
+            // Leave the drive first, or the unmount fails as "busy" for
+            // nothing more than this app showing it.
+            if self.current_dir.starts_with(&mount.mount_point) {
+                let home = std::env::var("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| PathBuf::from("/"));
+                self.navigate_to(home);
+            }
+            self.jobs.push(mounts::spawn_eject(mount.device));
+            self.eject_target = None;
+        } else if close {
+            self.eject_target = None;
+        }
+        if focus_pending_at_start && let Some(id) = first_id {
+            ui.ctx().memory_mut(|m| m.request_focus(id));
+            self.focus_first_action = false;
+        }
+    }
+
     /// R3's own row — Check for Update and Quit (Quit here just
     /// transitions into the existing `quit_confirm` flow above, unchanged
     /// otherwise). Replaces the old direct-R3-opens-Quit-confirmation
@@ -1587,6 +1727,26 @@ impl BrowDeckApp {
                 if r.clicked() {
                     self.update_error = None;
                     self.update_check = Some(update::spawn_check(env!("CARGO_PKG_VERSION")));
+                }
+            }
+            if let Some(bin) = self.iprolaunch_bin.clone() {
+                let r = Self::action_badge(
+                    self.badge_min_height(),
+                    ui,
+                    (self.icon(ICON_ROCKET_LAUNCH), "IProLaunch"),
+                );
+                first_id.get_or_insert(r.id);
+                row_ids.push(r.id);
+                if r.clicked() {
+                    // Same size BrowDeck itself runs at, so it lands the
+                    // same way under gamescope.
+                    let size = self
+                        .config_windowed_size
+                        .map(|s| (s.x.round() as u32, s.y.round() as u32));
+                    if let Err(e) = iprolaunch::open_gui(&bin, size) {
+                        eprintln!("opening IProLaunch failed: {e}");
+                    }
+                    self.menu_open = false;
                 }
             }
             let quit_btn = Self::action_badge(
@@ -2087,6 +2247,7 @@ impl BrowDeckApp {
 impl eframe::App for BrowDeckApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.reassert_window_size(ui.ctx());
+        self.thumbnails.poll(ui.ctx());
         let previously_unfinished: Vec<bool> = self.jobs.iter().map(|j| !j.finished).collect();
         for job in &mut self.jobs {
             job.poll();
@@ -2101,8 +2262,12 @@ impl eframe::App for BrowDeckApp {
             .iter()
             .zip(previously_unfinished)
             .any(|(job, was_unfinished)| was_unfinished && job.finished);
-        if any_just_finished && matches!(self.view, View::Dir) {
-            self.refresh();
+        if any_just_finished {
+            // Cheap, and an Eject job changes nothing else on screen.
+            self.mounts = mounts::list_mounts();
+            if matches!(self.view, View::Dir) {
+                self.refresh();
+            }
         }
         let has_active_job = self.jobs.iter().any(|j| !j.finished);
         self.jobs
@@ -2162,9 +2327,12 @@ impl eframe::App for BrowDeckApp {
         if let Some((mut install, version)) = self.update_install.take() {
             install.poll();
             if install.finished {
-                match install.error {
-                    Some(err) => self.update_error = Some(err),
-                    None => self.update_ready = Some(version),
+                // A cancelled install replaced nothing — just drop the job.
+                if !install.was_cancelled() {
+                    match install.error {
+                        Some(err) => self.update_error = Some(err),
+                        None => self.update_ready = Some(version),
+                    }
                 }
             } else {
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
@@ -2197,11 +2365,23 @@ impl eframe::App for BrowDeckApp {
             }
         }
 
+        // gilrs reads the pad directly, regardless of which window is in
+        // front — without this, every press in an app launched from here
+        // (IProLaunch, a game, a viewer) would also drive BrowDeck behind it.
+        let window_focused = ui.ctx().input(|i| i.viewport().focused) != Some(false);
         if let Some(gamepad) = &mut self.gamepad {
-            let actions = gamepad.poll();
-            // Keep polling at a game-loop-ish rate so held-direction repeat
-            // and stick input feel responsive, not just event-driven.
-            ui.ctx().request_repaint_after(Duration::from_millis(16));
+            let mut actions = gamepad.poll();
+            if window_focused {
+                // Keep polling at a game-loop-ish rate so held-direction
+                // repeat and stick input feel responsive, not just
+                // event-driven.
+                ui.ctx().request_repaint_after(Duration::from_millis(16));
+            } else {
+                // Still drained, so presses made elsewhere don't replay on
+                // return — just slowly, to stay off the CPU while a game runs.
+                actions.clear();
+                ui.ctx().request_repaint_after(Duration::from_millis(250));
+            }
             for action in actions {
                 // While the Rename/New Folder text field has real
                 // keyboard focus, gamepad d-pad/left-stick input is
@@ -2293,13 +2473,24 @@ impl eframe::App for BrowDeckApp {
                     }
                     gamepad::Action::Back => self.back_or_up(),
                     gamepad::Action::ContextMenu => {
+                        let focused_mount = (focused_pane == Some(Pane::Sidebar))
+                            .then(|| ui.ctx().memory(|m| m.focused()))
+                            .flatten()
+                            .and_then(|id| {
+                                self.sidebar_mount_ids
+                                    .iter()
+                                    .find(|(mid, _)| *mid == id)
+                                    .map(|(_, m)| m.clone())
+                            });
                         if !self.multi_select && matches!(self.view, View::Dir) {
                             self.select_focused_entry(ui.ctx());
                         }
                         if focused_pane == Some(Pane::Sidebar) {
                             self.select_focused_sidebar_custom_place(ui.ctx());
                         }
-                        if self.actions_available() {
+                        if let Some(mount) = focused_mount {
+                            self.open_eject(mount);
+                        } else if self.actions_available() {
                             self.context_menu_open = true;
                             self.focus_first_action = true;
                         }
@@ -2594,6 +2785,8 @@ impl eframe::App for BrowDeckApp {
             Rename,
             Compress,
             Permissions,
+            OpenWith,
+            Eject,
             Menu,
             UpdateAvailable,
             PasswordPrompt,
@@ -2625,6 +2818,12 @@ impl eframe::App for BrowDeckApp {
                 }
                 if show_permissions {
                     active_zones.push(FooterZone::Permissions);
+                }
+                if self.open_with.is_some() {
+                    active_zones.push(FooterZone::OpenWith);
+                }
+                if self.eject_target.is_some() {
+                    active_zones.push(FooterZone::Eject);
                 }
             }
             // Independent of Actions/Menu — a password prompt is
@@ -2735,6 +2934,8 @@ impl eframe::App for BrowDeckApp {
                                     FooterZone::Rename => self.show_rename_editor(ui),
                                     FooterZone::Compress => self.show_compress_editor(ui),
                                     FooterZone::Permissions => self.show_permission_editor(ui),
+                                    FooterZone::OpenWith => self.show_open_with_zone(ui),
+                                    FooterZone::Eject => self.show_eject_zone(ui),
                                     FooterZone::Menu => self.show_menu_zone(ui),
                                     FooterZone::UpdateAvailable => {
                                         self.show_update_available_zone(ui)
@@ -2865,6 +3066,8 @@ impl BrowDeckApp {
             ui.weak("(none)");
         }
         let mut clicked_mount = None;
+        let mut sidebar_mount_ids = Vec::new();
+        let mut eject_requested = None;
         for mount in visible_mounts {
             let mount_label = mount.mount_point.to_string_lossy().into_owned();
             let response = ui
@@ -2881,6 +3084,16 @@ impl BrowDeckApp {
             if response.clicked() {
                 clicked_mount = Some(mount.mount_point.clone());
             }
+            if mount.is_ejectable() {
+                sidebar_mount_ids.push((response.id, mount.clone()));
+                if response.secondary_clicked() {
+                    eject_requested = Some(mount.clone());
+                }
+            }
+        }
+        self.sidebar_mount_ids = sidebar_mount_ids;
+        if let Some(mount) = eject_requested {
+            self.open_eject(mount);
         }
         if let Some(dir) = clicked_place.or(clicked_mount) {
             self.navigate_to(dir);
@@ -3045,10 +3258,21 @@ impl BrowDeckApp {
                     } else {
                         self.selected.as_deref() == Some(entry.path.as_path())
                     };
-                    let response = ui.selectable_label(
-                        is_selected,
-                        (self.icon_scaled(icon), entry.name.as_str()),
-                    );
+                    let is_image = !entry.is_dir
+                        && preview::classify(&entry.path) == Some(preview::Kind::Image);
+                    let thumb_size = BASE_ICON_SIZE * self.icon_scale;
+                    let lead: egui::Atom = match self.thumbnails.get(&entry.path) {
+                        Some(texture) if is_image => egui::Image::from_texture(texture)
+                            .fit_to_exact_size(egui::vec2(thumb_size, thumb_size))
+                            .corner_radius(2.0)
+                            .into(),
+                        _ => self.icon_scaled(icon).into(),
+                    };
+                    let response = ui.selectable_label(is_selected, (lead, entry.name.as_str()));
+                    // Only rows actually on screen get decoded.
+                    if is_image && ui.is_rect_visible(response.rect) {
+                        self.thumbnails.request(&entry.path);
+                    }
                     if self.scroll_to_focus == Some(response.id) {
                         response.scroll_to_me(Some(egui::Align::Center));
                         self.scroll_to_focus = None;
@@ -3240,6 +3464,7 @@ impl BrowDeckApp {
         self.compress_editor = None;
         self.compress_editing = false;
         self.perm_editor = None;
+        self.open_with = None;
     }
 
     /// Flat, button-driven actions panel — not a mouse-style hover/right-click
@@ -3393,6 +3618,17 @@ impl BrowDeckApp {
                 if r.clicked() {
                     self.open_selected();
                     self.context_menu_open = false;
+                }
+                let r = Self::action_badge(
+                    self.badge_min_height(),
+                    ui,
+                    (self.icon(ICON_OPEN_WITH), "Open with"),
+                );
+                row_ids.push(r.id);
+                if r.clicked() {
+                    self.close_sub_editors();
+                    self.open_with = Some((path.clone(), openwith::apps_for(path)));
+                    self.focus_first_action = true;
                 }
             }
             if !paths.is_empty() {
@@ -3577,6 +3813,7 @@ impl BrowDeckApp {
             && self.perm_editor.is_none()
             && self.rename_editor.is_none()
             && self.compress_editor.is_none()
+            && self.open_with.is_none()
             && let Some(id) = first_id
         {
             ui.ctx().memory_mut(|m| m.request_focus(id));
@@ -4025,16 +4262,22 @@ impl BrowDeckApp {
         }
     }
 
-    fn show_progress_zone(&self, ui: &mut egui::Ui) {
+    fn show_progress_zone(&mut self, ui: &mut egui::Ui) {
+        let min_height = self.badge_min_height();
+        let mut rows: Vec<Vec<egui::Id>> = Vec::new();
+        let mut cancel_clicked = false;
         // `update_install` isn't part of `self.jobs` (see its own field
         // doc comment for why), but it's a `fileops::Job` all the same —
         // shows here too, chained on the end, so the download/extract
         // step actually gets a visible row instead of running silently.
         let update_job = self.update_install.as_ref().map(|(job, _)| job);
         for job in self.jobs.iter().chain(update_job) {
+            let mut row_ids = Vec::new();
             ui.horizontal(|ui| {
                 ui.strong("Progress");
-                if let Some(err) = &job.error {
+                if job.was_cancelled() {
+                    ui.weak(format!("{} cancelled", job.label));
+                } else if let Some(err) = &job.error {
                     ui.colored_label(egui::Color32::RED, format!("{}: {err}", job.label));
                 } else {
                     ui.label(&job.label);
@@ -4044,8 +4287,36 @@ impl BrowDeckApp {
                             .show_percentage()
                             .desired_width(200.0),
                     );
+                    if job.cancel_requested() {
+                        ui.weak("Cancelling…");
+                    } else if job.cancellable && !job.finished {
+                        let cancel = Self::action_badge(min_height, ui, "Cancel");
+                        row_ids.push(cancel.id);
+                        if cancel.clicked() {
+                            job.request_cancel();
+                            cancel_clicked = true;
+                        }
+                    }
                 }
             });
+            if !row_ids.is_empty() {
+                rows.push(row_ids);
+            }
+        }
+        // Progress alone is never a focus target (see `switch_pane`), so
+        // its Cancel badges are only gamepad-reachable as extra rows under
+        // an open Menu/Actions strip.
+        self.right_focus_rows.extend(rows);
+        // The focused Cancel badge disappears next frame — hand focus back
+        // to whichever interactive zone is still open.
+        if cancel_clicked
+            && (self.context_menu_open
+                || self.rename_editor.is_some()
+                || self.perm_editor.is_some()
+                || self.compress_editor.is_some()
+                || self.menu_open)
+        {
+            self.focus_first_action = true;
         }
     }
 }
