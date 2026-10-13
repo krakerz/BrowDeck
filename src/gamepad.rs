@@ -1,5 +1,5 @@
-use gilrs::{Axis, Button, EventType, Gilrs};
-use std::collections::HashMap;
+use gilrs::{Axis, Button, EventType, GamepadId, Gilrs};
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 /// Delay before a held direction starts auto-repeating.
@@ -66,6 +66,37 @@ pub struct GamepadInput {
     left_stick_direction: Option<egui::FocusDirection>,
     north_pressed_at: Option<Instant>,
     north_hold_fired: bool,
+    /// Physical pads Steam has wrapped in its own virtual gamepad — see
+    /// `ignored_devices_from_env`.
+    ignored_devices: HashSet<(u16, u16)>,
+}
+
+/// Steam Input re-exposes a physical pad (e.g. the Deck's built-in
+/// controls) as a "Steam Virtual Gamepad" while the physical one stays
+/// visible to evdev, so gilrs sees every press twice. Steam lists the
+/// physical ids in `SDL_GAMECONTROLLER_IGNORE_DEVICES` for SDL games to
+/// skip; this honors the same list (`0xVID/0xPID,...`).
+fn ignored_devices_from_env() -> HashSet<(u16, u16)> {
+    std::env::var("SDL_GAMECONTROLLER_IGNORE_DEVICES")
+        .map(|v| parse_device_list(&v))
+        .unwrap_or_default()
+}
+
+fn parse_device_list(list: &str) -> HashSet<(u16, u16)> {
+    let hex = |s: &str| {
+        let s = s.trim();
+        let s = s
+            .strip_prefix("0x")
+            .or_else(|| s.strip_prefix("0X"))
+            .unwrap_or(s);
+        u16::from_str_radix(s, 16).ok()
+    };
+    list.split(',')
+        .filter_map(|pair| {
+            let (vid, pid) = pair.split_once('/')?;
+            Some((hex(vid)?, hex(pid)?))
+        })
+        .collect()
 }
 
 impl GamepadInput {
@@ -81,6 +112,7 @@ impl GamepadInput {
                 left_stick_direction: None,
                 north_pressed_at: None,
                 north_hold_fired: false,
+                ignored_devices: ignored_devices_from_env(),
             }),
             Err(e) => {
                 eprintln!("gamepad input unavailable: {e}");
@@ -96,9 +128,30 @@ impl GamepadInput {
         self.gilrs.gamepads().next().is_some()
     }
 
+    fn is_listed(&self, id: GamepadId) -> bool {
+        let pad = self.gilrs.gamepad(id);
+        match (pad.vendor_id(), pad.product_id()) {
+            (Some(vid), Some(pid)) => self.ignored_devices.contains(&(vid, pid)),
+            _ => false,
+        }
+    }
+
+    /// Only when some other pad is still usable — if Steam listed a pad but
+    /// no virtual one showed up, dropping it would leave no input at all.
+    fn is_ignored(&self, id: GamepadId) -> bool {
+        self.is_listed(id)
+            && self
+                .gilrs
+                .gamepads()
+                .any(|(other, _)| !self.is_listed(other))
+    }
+
     pub fn poll(&mut self) -> Vec<Action> {
         let mut actions = Vec::new();
         while let Some(event) = self.gilrs.next_event() {
+            if self.is_ignored(event.id) {
+                continue;
+            }
             match event.event {
                 EventType::ButtonPressed(Button::North, _) => {
                     self.north_pressed_at = Some(Instant::now());
@@ -207,5 +260,28 @@ fn action_for(button: Button) -> Option<Action> {
         Button::LeftThumb => Some(Action::ToggleMultiSelect),
         Button::RightThumb => Some(Action::Menu),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn steam_ignore_list_parses_like_sdl() {
+        // Shape of the real value Steam sets on a Deck (trailing comma,
+        // mixed-case hex, duplicates).
+        let list = parse_device_list("0x28de/0x1205,0x28DE/0x11E0,0x3537/0x103e,0x28de/0x1205,");
+        assert!(list.contains(&(0x28de, 0x1205)));
+        assert!(list.contains(&(0x28de, 0x11e0)));
+        assert!(list.contains(&(0x3537, 0x103e)));
+        assert!(!list.contains(&(0x28de, 0x11ff)));
+        assert_eq!(list.len(), 3);
+    }
+
+    #[test]
+    fn malformed_entries_are_skipped() {
+        let list = parse_device_list("garbage,0x28de,/0x1,0xzz/0x1, 0x045e/0x028e ");
+        assert_eq!(list, HashSet::from([(0x045e, 0x028e)]));
     }
 }

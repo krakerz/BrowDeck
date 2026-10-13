@@ -1,7 +1,9 @@
+use crate::fileops::{Job, ProgressMsg};
 use egui_material_icons::MaterialIcon;
 use egui_material_icons::icons::{ICON_SD_CARD, ICON_STORAGE, ICON_USB};
 use std::path::PathBuf;
 
+#[derive(Clone)]
 pub struct Mount {
     pub device: String,
     pub mount_point: PathBuf,
@@ -29,6 +31,64 @@ impl Mount {
         self.mount_point.starts_with("/media")
             || self.mount_point.starts_with("/mnt")
             || self.mount_point.starts_with("/run/media")
+    }
+
+    /// Media udisks2 lets the active session unmount without root — its
+    /// auto-mounts under `/run/media`, plus anything the kernel flags as
+    /// removable (many USB enclosures don't, hence the path check).
+    pub fn is_ejectable(&self) -> bool {
+        self.removable || self.mount_point.starts_with("/run/media")
+    }
+}
+
+/// Unmounts via `udisksctl`, then tries to power the drive off. Power-off
+/// is best-effort: built-in SD readers and drives with another partition
+/// still mounted refuse it, and the unmount alone already makes removal
+/// safe.
+pub fn spawn_eject(device: String) -> Job {
+    let (mut job, tx) = Job::new("Ejecting", None);
+    job.cancellable = false;
+    std::thread::spawn(move || {
+        tx.send(ProgressMsg::Progress { done: 0, total: 1 });
+        match udisksctl(&["unmount", "-b", &device]) {
+            Ok(()) => {
+                let _ = udisksctl(&["power-off", "-b", &device]);
+                tx.send(ProgressMsg::Progress { done: 1, total: 1 });
+                tx.send(ProgressMsg::Done);
+            }
+            Err(e) => tx.send(ProgressMsg::Error(e)),
+        }
+    });
+    job
+}
+
+fn udisksctl(args: &[&str]) -> Result<(), String> {
+    // Fails fast instead of waiting on a polkit password prompt that Game
+    // Mode has no agent to show.
+    let output = std::process::Command::new("udisksctl")
+        .args(args)
+        .arg("--no-user-interaction")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("couldn't run udisksctl: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(short_udisks_error(&String::from_utf8_lossy(&output.stderr)))
+    }
+}
+
+/// udisksctl errors wrap the useful part in D-Bus noise, e.g. "Error
+/// unmounting /dev/sdb1: GDBus.Error:org.freedesktop.UDisks2.Error.
+/// DeviceBusy: Error unmounting /dev/sdb1: target is busy" — keep only the
+/// last clause.
+fn short_udisks_error(stderr: &str) -> String {
+    let trimmed = stderr.trim();
+    let last = trimmed.rsplit(": ").next().unwrap_or(trimmed).trim();
+    if last.is_empty() {
+        "eject failed".to_string()
+    } else {
+        format!("eject failed: {last}")
     }
 }
 
@@ -125,6 +185,25 @@ mod tests {
         assert!(mount("/media/deck/MY_USB").is_common_location());
         assert!(mount("/mnt/data").is_common_location());
         assert!(mount("/run/media/deck/MY_USB").is_common_location());
+    }
+
+    #[test]
+    fn ejectable_covers_udisks_mounts_and_removable_devices_only() {
+        let mut usb_ssd = mount("/run/media/deck/SSD");
+        usb_ssd.removable = false;
+        assert!(usb_ssd.is_ejectable());
+        assert!(mount("/mnt/sdcard").is_ejectable());
+        let mut root = mount("/");
+        root.removable = false;
+        assert!(!root.is_ejectable());
+    }
+
+    #[test]
+    fn udisks_errors_are_trimmed_to_their_last_clause() {
+        let raw = "Error unmounting /dev/sdb1: GDBus.Error:org.freedesktop.UDisks2.Error.DeviceBusy: \
+                   Error unmounting /dev/sdb1: target is busy\n";
+        assert_eq!(short_udisks_error(raw), "eject failed: target is busy");
+        assert_eq!(short_udisks_error("  "), "eject failed");
     }
 
     #[test]

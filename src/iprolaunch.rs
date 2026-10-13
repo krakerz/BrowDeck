@@ -43,6 +43,31 @@ pub fn run(bin: &Path, target: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Opens IProLaunch's own window: `<bin> -gm [WxH]` (no size = fullscreen).
+/// When BrowDeck runs as a Steam shortcut, Steam's overlay `LD_PRELOAD` and
+/// runtime `LD_LIBRARY_PATH` are in its environment; both are stripped so
+/// IProLaunch starts clean instead of inheriting them.
+pub fn open_gui(bin: &Path, size: Option<(u32, u32)>) -> std::io::Result<()> {
+    let mut child = Command::new(bin)
+        .args(gui_args(size))
+        .env_remove("LD_PRELOAD")
+        .env_remove("LD_LIBRARY_PATH")
+        .stdin(std::process::Stdio::null())
+        .spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+fn gui_args(size: Option<(u32, u32)>) -> Vec<String> {
+    let mut args = vec!["-gm".to_string()];
+    if let Some((w, h)) = size {
+        args.push(format!("{w}x{h}"));
+    }
+    args
+}
+
 /// Whether `target` is already a registered library profile: runs
 /// `<bin> library search <target>` and checks whether any returned
 /// profile's path is *exactly* `target` — search itself is a
@@ -137,6 +162,12 @@ mod tests {
             ),
             Some("/media/media/Games/Non Steam/.!/CIRCLEMATE/CIRCLEMATE.exe")
         );
+    }
+
+    #[test]
+    fn gui_args_pass_the_window_size_only_when_windowed() {
+        assert_eq!(gui_args(None), vec!["-gm"]);
+        assert_eq!(gui_args(Some((1280, 800))), vec!["-gm", "1280x800"]);
     }
 
     #[test]
