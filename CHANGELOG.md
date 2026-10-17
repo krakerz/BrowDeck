@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [1.12.0] — 2026-10-17
+
 ### Added
 - On a Steam Deck, pressing A on a name or password field opens Steam's
   on-screen keyboard, and it closes again when editing ends
