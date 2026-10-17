@@ -1,12 +1,16 @@
 //! Steam's on-screen keyboard, opened the same way SDL does for games on the
 //! Deck: Steam handles `steam://open/keyboard` / `steam://close/keyboard`
-//! URLs, and sets `SteamDeck=1` in the environment of everything it launches
-//! there (SDL gates on the same variable).
+//! URLs.
 
 use std::process::{Command, Stdio};
 
+/// Steam's Game Mode session sets `SDL_ENABLE_STEAM_SCREEN_KEYBOARD=1` for
+/// what it launches; the desktop client doesn't, so the keyboard isn't
+/// forced on a desktop user. `SteamDeck=1` is SDL's own check, kept for
+/// stock SteamOS — confirmed absent on a non-SteamOS Deck (2026-10-17).
 pub fn available() -> bool {
-    std::env::var("SteamDeck").is_ok_and(|v| v == "1")
+    let set = |name| std::env::var(name).is_ok_and(|v| v == "1");
+    set("SDL_ENABLE_STEAM_SCREEN_KEYBOARD") || set("SteamDeck")
 }
 
 /// `field` is the text field's rect in physical pixels, relative to the
@@ -29,10 +33,14 @@ fn open_url(field: Option<[i32; 4]>) -> String {
     }
 }
 
+/// Through the `steam` script, which hands the URL to the running client —
+/// confirmed to open the keyboard in Game Mode, where routing through
+/// `xdg-open` depends on the session's URL-handler setup.
 fn send(url: &str) {
-    // Steam's overlay/runtime libraries would otherwise leak into xdg-open
-    // (same reason as `iprolaunch::open_gui`).
-    let spawned = Command::new("xdg-open")
+    let steam = std::env::var("STEAMSCRIPT").unwrap_or_else(|_| "steam".to_string());
+    // Steam's overlay/runtime libraries would otherwise leak into the
+    // script (same reason as `iprolaunch::open_gui`).
+    let spawned = Command::new(steam)
         .arg(url)
         .env_remove("LD_PRELOAD")
         .env_remove("LD_LIBRARY_PATH")
