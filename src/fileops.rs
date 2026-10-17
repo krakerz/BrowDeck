@@ -259,13 +259,16 @@ fn spawn_extract_impl(archive: PathBuf, dest_dir: PathBuf, password: Option<Stri
 }
 
 fn run_extract(archive_path: &Path, dest_dir: &Path, password: Option<&str>, tx: &Reporter) {
+    let Some(staging) = make_staging(dest_dir, tx) else {
+        return;
+    };
     let result: Result<(), ExtractFailure> = match archive_kind(archive_path) {
-        Some(ArchiveKind::Zip) => extract_zip(archive_path, dest_dir, password, tx),
+        Some(ArchiveKind::Zip) => extract_zip(archive_path, &staging, password, tx),
         Some(ArchiveKind::Tar) => {
-            extract_tar(archive_path, dest_dir, tx).map_err(ExtractFailure::Error)
+            extract_tar(archive_path, &staging, tx).map_err(ExtractFailure::Error)
         }
         Some(ArchiveKind::TarGz) => {
-            extract_tar_gz(archive_path, dest_dir, tx).map_err(ExtractFailure::Error)
+            extract_tar_gz(archive_path, &staging, tx).map_err(ExtractFailure::Error)
         }
         // Callers route `.rar` through `spawn_extract_rar` instead —
         // reachable here only if that dispatch is ever bypassed.
@@ -276,17 +279,81 @@ fn run_extract(archive_path: &Path, dest_dir: &Path, password: Option<&str>, tx:
             "unsupported archive format".to_string(),
         )),
     };
+    finish_staged(&staging, dest_dir, result, tx);
+}
+
+/// Extraction lands in a hidden staging folder first, so a
+/// cancelled or failed run never leaves partial files mixed into the user's
+/// folder. Inside `dest_dir` so the final merge is a same-filesystem rename.
+fn make_staging(dest_dir: &Path, tx: &Reporter) -> Option<PathBuf> {
+    let staging = unique_dest(&dest_dir.join(".browdeck-extracting"));
+    match std::fs::create_dir_all(&staging) {
+        Ok(()) => Some(staging),
+        Err(e) => {
+            tx.send(ProgressMsg::Error(e.to_string()));
+            None
+        }
+    }
+}
+
+/// Merges a successful extraction into `dest_dir`; on any failure discards
+/// the staging folder (a password retry re-runs the whole extract anyway).
+fn finish_staged(
+    staging: &Path,
+    dest_dir: &Path,
+    result: Result<(), ExtractFailure>,
+    tx: &Reporter,
+) {
+    let result = result.and_then(|()| {
+        merge_into(staging, dest_dir)
+            .and_then(|()| std::fs::remove_dir(staging).map_err(|e| e.to_string()))
+            .map_err(ExtractFailure::Error)
+    });
     match result {
         Ok(()) => {
             tx.send(ProgressMsg::Done);
         }
-        Err(ExtractFailure::PasswordRequired) => {
-            tx.send(ProgressMsg::PasswordRequired);
-        }
-        Err(ExtractFailure::Error(e)) => {
-            tx.send(ProgressMsg::Error(e));
+        Err(failure) => {
+            let _ = std::fs::remove_dir_all(staging);
+            tx.send(match failure {
+                ExtractFailure::PasswordRequired => ProgressMsg::PasswordRequired,
+                ExtractFailure::Error(e) => ProgressMsg::Error(e),
+            });
         }
     }
+}
+
+/// Moves every entry of `from` into `to`, merging directories that exist on
+/// both sides and replacing same-named files (what extracting in place did).
+fn merge_into(from: &Path, to: &Path) -> Result<(), String> {
+    for entry in std::fs::read_dir(from).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let source = entry.path();
+        let target = to.join(entry.file_name());
+        match std::fs::symlink_metadata(&target) {
+            Err(_) => {}
+            Ok(target_meta) => {
+                let source_meta = std::fs::symlink_metadata(&source).map_err(|e| e.to_string())?;
+                if source_meta.is_dir() && target_meta.is_dir() {
+                    merge_into(&source, &target)?;
+                    std::fs::remove_dir(&source).map_err(|e| e.to_string())?;
+                    continue;
+                }
+                // Replacing a whole folder with a file (or the reverse)
+                // would delete user data; extracting in place refused that
+                // too.
+                if source_meta.is_dir() || target_meta.is_dir() {
+                    return Err(format!(
+                        "{} already exists as a different kind of item",
+                        target.display()
+                    ));
+                }
+                remove_path(&target)?;
+            }
+        }
+        std::fs::rename(&source, &target).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 fn extract_zip(
@@ -434,17 +501,11 @@ fn run_extract_rar(
     tx: &Reporter,
 ) {
     tx.send(ProgressMsg::Progress { done: 0, total: 1 });
-    match extract_rar_command(tool, archive, dest_dir, password, || tx.is_cancelled()) {
-        Ok(()) => {
-            tx.send(ProgressMsg::Done);
-        }
-        Err(ExtractFailure::PasswordRequired) => {
-            tx.send(ProgressMsg::PasswordRequired);
-        }
-        Err(ExtractFailure::Error(e)) => {
-            tx.send(ProgressMsg::Error(e));
-        }
-    }
+    let Some(staging) = make_staging(dest_dir, tx) else {
+        return;
+    };
+    let result = extract_rar_command(tool, archive, &staging, password, || tx.is_cancelled());
+    finish_staged(&staging, dest_dir, result, tx);
 }
 
 fn extract_rar_command(
@@ -703,13 +764,31 @@ fn run_job(sources: &[PathBuf], dest_dir: &Path, is_move: bool, tx: &Reporter) {
         let Some(file_name) = src.file_name() else {
             continue;
         };
-        let dest = dest_dir.join(file_name);
+        if src.is_dir() && dest_dir.starts_with(src) {
+            tx.send(ProgressMsg::Error(format!(
+                "can't put {} inside itself",
+                file_name.to_string_lossy()
+            )));
+            return;
+        }
+        if is_move && src.parent() == Some(dest_dir) {
+            done += size_of(src);
+            continue;
+        }
+        // Never write onto an existing path: pasting a copy into its own
+        // folder would otherwise truncate the source before reading it.
+        let dest = unique_dest(&dest_dir.join(file_name));
         let result = if is_move {
             move_one(src, &dest, size_of(src), &mut done, total, tx)
         } else {
             copy_one(src, &dest, &mut done, total, tx)
         };
         if let Err(e) = result {
+            // A move whose rename already landed has no src left and `dest`
+            // is then the only copy; otherwise `dest` is this job's partial.
+            if e == CANCELLED && std::fs::symlink_metadata(src).is_ok() && dest.exists() {
+                let _ = remove_path(&dest);
+            }
             tx.send(ProgressMsg::Error(e));
             return;
         }
@@ -736,6 +815,28 @@ fn walk_size(path: &Path, total: &mut u64) {
     } else {
         *total += meta.len();
     }
+}
+
+/// `path` if nothing exists there yet, else the first free `name (N).ext`
+/// (the extension being everything after the first non-leading dot, so
+/// `a.tar.gz` becomes `a (2).tar.gz`).
+pub fn unique_dest(path: &Path) -> PathBuf {
+    if std::fs::symlink_metadata(path).is_err() {
+        return path.to_path_buf();
+    }
+    let parent = path.parent().unwrap_or(Path::new(""));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (stem, ext) = match name.char_indices().find(|&(i, c)| i > 0 && c == '.') {
+        Some((i, _)) => name.split_at(i),
+        None => (name.as_str(), ""),
+    };
+    (2..)
+        .map(|n| parent.join(format!("{stem} ({n}){ext}")))
+        .find(|candidate| std::fs::symlink_metadata(candidate).is_err())
+        .expect("unbounded range")
 }
 
 fn copy_one(
@@ -850,6 +951,73 @@ mod tests {
                 ProgressMsg::PasswordRequired => return Err("password required".to_string()),
             }
         }
+    }
+
+    #[test]
+    fn copy_into_own_folder_keeps_the_source_and_adds_a_numbered_copy() {
+        let root = scratch_dir("copy_self");
+        let src = root.join("a.tar.gz");
+        std::fs::write(&src, b"payload").unwrap();
+
+        let (job, tx) = Job::new("Copying", None);
+        run_job(std::slice::from_ref(&src), &root, false, &tx);
+
+        assert!(wait_done(&job.receiver).is_ok());
+        assert_eq!(std::fs::read(&src).unwrap(), b"payload");
+        assert_eq!(
+            std::fs::read(root.join("a (2).tar.gz")).unwrap(),
+            b"payload"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn folder_into_itself_is_refused() {
+        let root = scratch_dir("copy_into_self");
+        let folder = root.join("f");
+        std::fs::create_dir_all(folder.join("sub")).unwrap();
+
+        let (job, tx) = Job::new("Copying", None);
+        run_job(
+            std::slice::from_ref(&folder),
+            &folder.join("sub"),
+            false,
+            &tx,
+        );
+
+        assert!(wait_done(&job.receiver).is_err());
+        assert!(!folder.join("sub/f").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn move_into_own_folder_is_a_no_op() {
+        let root = scratch_dir("move_self");
+        let src = root.join("a.txt");
+        std::fs::write(&src, b"x").unwrap();
+
+        let (job, tx) = Job::new("Moving", None);
+        run_job(std::slice::from_ref(&src), &root, true, &tx);
+
+        assert!(wait_done(&job.receiver).is_ok());
+        assert!(src.exists());
+        assert!(!root.join("a (2).txt").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn unique_dest_numbers_around_existing_names() {
+        let root = scratch_dir("unique_dest");
+        assert_eq!(unique_dest(&root.join("new")), root.join("new"));
+        std::fs::write(root.join(".bashrc"), b"").unwrap();
+        assert_eq!(unique_dest(&root.join(".bashrc")), root.join(".bashrc (2)"));
+        std::fs::write(root.join("日本.txt"), b"").unwrap();
+        std::fs::write(root.join("日本 (2).txt"), b"").unwrap();
+        assert_eq!(
+            unique_dest(&root.join("日本.txt")),
+            root.join("日本 (3).txt")
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -1045,6 +1213,119 @@ mod tests {
         );
         assert!(!root.join("escape.txt").exists());
 
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn cancelled_copy_of_a_folder_leaves_no_destination_folder() {
+        let root = scratch_dir("cancel_copy_dir");
+        let src = root.join("folder");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub/a.bin"), vec![1u8; 4096]).unwrap();
+        let dest_dir = root.join("dest");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+
+        let (job, tx) = Job::new("Copying", None);
+        job.request_cancel();
+        run_job(std::slice::from_ref(&src), &dest_dir, false, &tx);
+
+        assert_eq!(wait_done(&job.receiver), Err(CANCELLED.to_string()));
+        assert_eq!(std::fs::read_dir(&dest_dir).unwrap().count(), 0);
+        assert!(src.join("sub/a.bin").exists());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn cancelled_extract_leaves_dest_dir_untouched() {
+        let root = scratch_dir("cancel_extract");
+        let archive_path = root.join("test.zip");
+        {
+            let file = std::fs::File::create(&archive_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+            zip.start_file("a.txt", options).unwrap();
+            zip.write_all(b"a").unwrap();
+            zip.start_file("b/c.txt", options).unwrap();
+            zip.write_all(b"c").unwrap();
+            zip.finish().unwrap();
+        }
+        let dest_dir = root.join("dest");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::write(dest_dir.join("existing.txt"), b"keep").unwrap();
+
+        let (job, tx) = Job::new("Extracting", None);
+        job.request_cancel();
+        run_extract(&archive_path, &dest_dir, None, &tx);
+
+        assert_eq!(wait_done(&job.receiver), Err(CANCELLED.to_string()));
+        let names: Vec<_> = std::fs::read_dir(&dest_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["existing.txt".to_string()]);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn extract_merges_into_existing_folders_and_overwrites_same_named_files() {
+        let root = scratch_dir("extract_merge");
+        let archive_path = root.join("test.zip");
+        {
+            let file = std::fs::File::create(&archive_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+            zip.start_file("sub/new.txt", options).unwrap();
+            zip.write_all(b"new").unwrap();
+            zip.start_file("same.txt", options).unwrap();
+            zip.write_all(b"from archive").unwrap();
+            zip.finish().unwrap();
+        }
+        let dest_dir = root.join("dest");
+        std::fs::create_dir_all(dest_dir.join("sub")).unwrap();
+        std::fs::write(dest_dir.join("sub/old.txt"), b"old").unwrap();
+        std::fs::write(dest_dir.join("same.txt"), b"from disk").unwrap();
+
+        let job = spawn_extract(archive_path, dest_dir.clone());
+        wait_done(&job.receiver).unwrap();
+
+        assert_eq!(std::fs::read(dest_dir.join("sub/old.txt")).unwrap(), b"old");
+        assert_eq!(std::fs::read(dest_dir.join("sub/new.txt")).unwrap(), b"new");
+        assert_eq!(
+            std::fs::read(dest_dir.join("same.txt")).unwrap(),
+            b"from archive"
+        );
+        let leftovers = std::fs::read_dir(&dest_dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".browdeck-extracting")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn extract_never_replaces_a_folder_with_a_file() {
+        let root = scratch_dir("extract_kind_clash");
+        let from = root.join("staging");
+        let to = root.join("dest");
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::create_dir_all(to.join("photos")).unwrap();
+        std::fs::write(to.join("photos/keep.jpg"), b"precious").unwrap();
+        std::fs::write(from.join("photos"), b"a file").unwrap();
+
+        assert!(merge_into(&from, &to).is_err());
+        assert_eq!(
+            std::fs::read(to.join("photos/keep.jpg")).unwrap(),
+            b"precious"
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 

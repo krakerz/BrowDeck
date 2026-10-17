@@ -21,10 +21,14 @@ default; borderless fullscreen is available via `config.toml`.
   change permissions (single file or a whole multi-selection), all from
   a button-driven actions panel
 - Cancel running copy, move, extract, compress, and update-download jobs;
-  a cancelled copy or compress removes its half-written file or archive
+  a cancelled job leaves no half-written files behind
+- Pasting never overwrites: a same-named item is saved as "name (2)"
 - "Open with" from the Actions row: pick which installed app opens a file
   (default app listed first; Flatpak apps included, terminal-only apps
   left out)
+- On a Steam Deck, pressing A on a name or password field opens Steam's
+  on-screen keyboard automatically, and the text being typed is shown at
+  the top of the screen so the keyboard doesn't hide it
 - Multi-select for batch operations
 - Sidebar: XDG places, real block-device mounts with USB/microSD
   detection, pinned folders, a trash view with restore/empty, a

@@ -11,6 +11,7 @@ mod gamepad;
 mod iprolaunch;
 mod mounts;
 mod openwith;
+mod osk;
 mod permissions;
 mod places;
 mod preview;
