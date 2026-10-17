@@ -1,7 +1,7 @@
 use crate::fileops::{Job, ProgressMsg};
 use egui_material_icons::MaterialIcon;
 use egui_material_icons::icons::{ICON_SD_CARD, ICON_STORAGE, ICON_USB};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
 pub struct Mount {
@@ -141,31 +141,26 @@ fn unescape_octal(s: &str) -> String {
 }
 
 fn is_removable(device: &str) -> bool {
-    let Some(name) = device.strip_prefix("/dev/") else {
+    // Resolves `/dev/disk/by-*` and `/dev/mapper/*` links to the kernel name.
+    let device = std::fs::canonicalize(device).unwrap_or_else(|_| PathBuf::from(device));
+    let Some(name) = device.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
-    let parent = parent_block_device(name);
-    std::fs::read_to_string(format!("/sys/block/{parent}/removable"))
-        .map(|s| s.trim() == "1")
-        .unwrap_or(false)
+    disk_is_removable(Path::new("/sys/class/block"), name)
 }
 
-/// Maps a partition device name to its parent disk, e.g. `sda1` -> `sda`,
-/// `nvme0n1p1` -> `nvme0n1`, `mmcblk0p1` -> `mmcblk0` (microSD readers).
-fn parent_block_device(name: &str) -> String {
-    if let Some(pos) = name.rfind('p')
-        && name[..pos].ends_with(|c: char| c.is_ascii_digit())
-        && !name[pos + 1..].is_empty()
-        && name[pos + 1..].chars().all(|c| c.is_ascii_digit())
-    {
-        return name[..pos].to_string();
-    }
-    let trimmed = name.trim_end_matches(|c: char| c.is_ascii_digit());
-    if trimmed.is_empty() {
-        name.to_string()
+/// `removable` lives on the whole disk only. A partition's sysfs entry has a
+/// `partition` file and sits inside its disk's directory, so `..` reaches
+/// the disk whatever its naming scheme (`sda1`, `nvme0n1p1`, `mmcblk0p1`,
+/// or a whole disk mounted with no partition table).
+fn disk_is_removable(sys_block: &Path, name: &str) -> bool {
+    let entry = sys_block.join(name);
+    let disk = if entry.join("partition").exists() {
+        entry.join("..")
     } else {
-        trimmed.to_string()
-    }
+        entry
+    };
+    std::fs::read_to_string(disk.join("removable")).is_ok_and(|s| s.trim() == "1")
 }
 
 #[cfg(test)]
@@ -204,6 +199,37 @@ mod tests {
                    Error unmounting /dev/sdb1: target is busy\n";
         assert_eq!(short_udisks_error(raw), "eject failed: target is busy");
         assert_eq!(short_udisks_error("  "), "eject failed");
+    }
+
+    #[test]
+    fn removable_is_read_from_the_whole_disk() {
+        let root = std::env::temp_dir().join(format!(
+            "browdeck_test_sysblock_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Mirrors sysfs: real dirs under `devices/`, symlinks in `class/`.
+        let devices = root.join("devices");
+        let class = root.join("class");
+        std::fs::create_dir_all(&class).unwrap();
+        for (disk, part, removable) in
+            [("mmcblk0", "mmcblk0p1", "1"), ("nvme0n1", "nvme0n1p2", "0")]
+        {
+            std::fs::create_dir_all(devices.join(disk).join(part)).unwrap();
+            std::fs::write(devices.join(disk).join("removable"), removable).unwrap();
+            std::fs::write(devices.join(disk).join(part).join("partition"), "1").unwrap();
+            std::os::unix::fs::symlink(devices.join(disk), class.join(disk)).unwrap();
+            std::os::unix::fs::symlink(devices.join(disk).join(part), class.join(part)).unwrap();
+        }
+        assert!(disk_is_removable(&class, "mmcblk0p1"));
+        assert!(disk_is_removable(&class, "mmcblk0"));
+        assert!(!disk_is_removable(&class, "nvme0n1p2"));
+        assert!(!disk_is_removable(&class, "nvme0n1"));
+        assert!(!disk_is_removable(&class, "missing"));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

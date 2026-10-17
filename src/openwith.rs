@@ -49,8 +49,12 @@ pub fn launch(app: &App, path: &Path) -> std::io::Result<()> {
     let Some((program, args)) = argv.split_first() else {
         return Err(std::io::Error::other("empty Exec line"));
     };
+    // Same Steam overlay/runtime leak as `iprolaunch::open_gui`: when
+    // BrowDeck runs as a Steam shortcut these would be forced on the app.
     let mut child = std::process::Command::new(program)
         .args(args)
+        .env_remove("LD_PRELOAD")
+        .env_remove("LD_LIBRARY_PATH")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -132,8 +136,8 @@ fn collect_entries(
     }
 }
 
-/// `(Name, Exec, MimeType list)` of a launchable, visible application
-/// entry; `None` for anything hidden, non-application, or incomplete.
+/// `(Name, Exec, MimeType list)` of a launchable application entry; `None`
+/// for anything `Hidden`, non-application, or incomplete.
 fn parse_desktop_entry(contents: &str) -> Option<(String, String, Vec<String>)> {
     let mut in_main = false;
     let mut name = None;
@@ -164,9 +168,11 @@ fn parse_desktop_entry(contents: &str) -> Option<(String, String, Vec<String>)> 
                     .map(str::to_string)
                     .collect();
             }
+            // `NoDisplay` only hides an app from menus — the spec still
+            // counts it as a handler for its MIME types, so it stays.
             // Terminal apps need a terminal to host them, which this
             // launches without.
-            "Hidden" | "NoDisplay" | "Terminal" if value == "true" => return None,
+            "Hidden" | "Terminal" if value == "true" => return None,
             _ => {}
         }
     }
@@ -407,8 +413,10 @@ Exec=eog --new-window
 
     #[test]
     fn hidden_and_non_application_entries_are_skipped() {
-        let hidden = "[Desktop Entry]\nType=Application\nName=X\nExec=x\nNoDisplay=true\n";
+        let hidden = "[Desktop Entry]\nType=Application\nName=X\nExec=x\nHidden=true\n";
         assert!(parse_desktop_entry(hidden).is_none());
+        let handler_only = "[Desktop Entry]\nType=Application\nName=X\nExec=x\nNoDisplay=true\n";
+        assert!(parse_desktop_entry(handler_only).is_some());
         let link = "[Desktop Entry]\nType=Link\nName=X\nURL=https://example.com\n";
         assert!(parse_desktop_entry(link).is_none());
         let tui = "[Desktop Entry]\nType=Application\nName=Vim\nExec=vim %F\nTerminal=true\n";

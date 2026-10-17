@@ -1,5 +1,32 @@
 ## [Unreleased]
 
+### Added
+- On a Steam Deck, pressing A on a name or password field opens Steam's
+  on-screen keyboard, and it closes again when editing ends
+- While typing a name or password with a gamepad, the text is mirrored
+  near the top of the screen so Steam's on-screen keyboard doesn't hide it
+
+### Changed
+- Extraction now unpacks into a hidden temporary folder and moves the
+  files in only when it succeeds
+- "Open with" also lists apps that are hidden from menus but registered
+  for the file type
+
+### Fixed
+- Image thumbnails update after a file is replaced, and retry after a
+  failed load, without leaving the folder
+- Cancelling an extract or a folder copy no longer leaves partial files
+  behind
+- Apps started with "Open with" no longer inherit Steam's overlay and
+  runtime libraries
+- SD cards and drives mounted without a partition table are recognized
+  as removable, so Eject is offered for them
+- Pasting a copied file into the folder it came from no longer empties
+  the original; the copy is saved as "name (2)" instead
+- Copy, move, and compress no longer overwrite an existing file with the
+  same name; the new one gets a numbered name
+- Pasting a folder inside itself is refused instead of copying forever
+
 ## [1.11.0] — 2026-10-13
 
 ### Added

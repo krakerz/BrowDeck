@@ -1,6 +1,6 @@
 use crate::{
     custom_places, deleted, fileicons, fileinfo, fileops, fonts, gamepad, iprolaunch, mounts,
-    openwith, permissions, places, preview, thumbnails, update,
+    openwith, osk, permissions, places, preview, thumbnails, update,
 };
 use egui_material_icons::MaterialIcon;
 use egui_material_icons::icons::{
@@ -239,6 +239,12 @@ pub struct BrowDeckApp {
     /// password prompt's own text field.
     password_prompt_editing: bool,
     password_prompt_focus_pending: bool,
+    /// Running on a Deck under Steam, where its on-screen keyboard can be
+    /// opened for us — checked once at startup.
+    osk_available: bool,
+    /// Whether this app asked Steam to show its keyboard, so leaving edit
+    /// mode closes only a keyboard it opened.
+    osk_open: bool,
     search_query: String,
     search_open: bool,
     /// One-shot flags consumed the next time the relevant widget is drawn.
@@ -466,6 +472,8 @@ impl BrowDeckApp {
             compress_editor: None,
             open_with: None,
             rename_editing: false,
+            osk_available: osk::available(),
+            osk_open: false,
             rename_focus_pending: false,
             compress_editing: false,
             compress_focus_pending: false,
@@ -645,6 +653,8 @@ impl BrowDeckApp {
             })
             .collect();
         self.sort_entries(&mut entries);
+        self.thumbnails
+            .forget_changed(entries.iter().map(|e| (e.path.as_path(), e.modified)));
         self.entries = entries;
     }
 
@@ -2994,10 +3004,86 @@ impl eframe::App for BrowDeckApp {
             }
         });
         self.central_rect = Some(central_resp.response.rect);
+        self.sync_on_screen_keyboard(ui.ctx());
+        self.show_keyboard_echo(ui.ctx());
     }
 }
 
 impl BrowDeckApp {
+    /// Opens Steam's keyboard when a name/password field enters editing
+    /// mode (A on the field) and closes it when editing ends, so the user
+    /// doesn't have to summon it from Steam's menu each time. Only with a
+    /// pad connected: with a real keyboard it would just be in the way.
+    fn sync_on_screen_keyboard(&mut self, ctx: &egui::Context) {
+        if !self.osk_available {
+            return;
+        }
+        let editing = self.rename_editing || self.compress_editing || self.password_prompt_editing;
+        if editing && !self.osk_open {
+            if !self.gamepad.as_ref().is_some_and(|g| g.has_connected_pad()) {
+                return;
+            }
+            let ppp = ctx.pixels_per_point();
+            let field = ctx
+                .memory(|m| m.focused())
+                .and_then(|id| ctx.read_response(id))
+                .map(|r| r.rect)
+                .or(self.actions_strip_rect)
+                .map(|r| {
+                    let r = r * ppp;
+                    [r.min.x, r.min.y, r.width(), r.height()].map(|v| v.round() as i32)
+                });
+            osk::open(field);
+            self.osk_open = true;
+        } else if !editing && self.osk_open {
+            osk::close();
+            self.osk_open = false;
+        }
+    }
+
+    /// Steam's on-screen keyboard covers the bottom of the screen, where
+    /// every name/password field lives — so while one is being typed into
+    /// with a pad connected, its text is mirrored near the top. Display
+    /// only: input still goes to the real field below.
+    fn show_keyboard_echo(&self, ctx: &egui::Context) {
+        if !self.gamepad.as_ref().is_some_and(|g| g.has_connected_pad()) {
+            return;
+        }
+        let (label, text) = if self.rename_editing
+            && let Some(editor) = &self.rename_editor
+        {
+            let label = if editor.target.is_some() {
+                "Rename"
+            } else {
+                "New folder"
+            };
+            (label, editor.text.clone())
+        } else if self.compress_editing
+            && let Some(editor) = &self.compress_editor
+        {
+            ("Archive name", editor.name.clone())
+        } else if self.password_prompt_editing
+            && let Some(prompt) = &self.password_prompt
+        {
+            ("Password", "•".repeat(prompt.password.chars().count()))
+        } else {
+            return;
+        };
+        egui::Area::new(egui::Id::new("keyboard_echo"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 48.0))
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .inner_margin(12.0)
+                    .show(ui, |ui| {
+                        ui.set_min_width(ctx.content_rect().width() * 0.6);
+                        ui.weak(label);
+                        ui.heading(text);
+                    });
+            });
+    }
+
     fn show_sidebar_contents(&mut self, ui: &mut egui::Ui) {
         // No `apply_pending_scroll` here — right-stick scroll moves the
         // selection in this pane now (see the `Action::Scroll` handler),
@@ -4237,7 +4323,7 @@ impl BrowDeckApp {
                     fileops::CompressKind::Zip => "zip",
                     fileops::CompressKind::TarGz => "tar.gz",
                 };
-                let dest = self.current_dir.join(format!("{trimmed}.{ext}"));
+                let dest = fileops::unique_dest(&self.current_dir.join(format!("{trimmed}.{ext}")));
                 self.jobs.push(fileops::spawn_compress(paths, dest, kind));
                 self.compress_editor = None;
                 self.context_menu_open = false;

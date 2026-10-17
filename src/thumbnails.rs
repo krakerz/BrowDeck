@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 /// Square edge of a generated thumbnail, in pixels — comfortably above the
 /// file list's largest zoomed icon size, so it never upscales.
@@ -21,14 +22,22 @@ struct Request {
 struct Decoded {
     path: PathBuf,
     generation: u64,
+    modified: Option<SystemTime>,
     image: Option<egui::ColorImage>,
 }
 
+/// A decode result plus the source's mtime at decode time, so a refresh can
+/// tell an overwritten file from an unchanged one.
+struct Cached {
+    modified: Option<SystemTime>,
+    texture: Option<egui::TextureHandle>,
+}
+
 /// Small square image thumbnails for the file list, decoded off the UI
-/// thread. `None` in `textures` marks a file that failed to decode, so it
-/// isn't retried every frame.
+/// thread. A `None` texture marks a file that failed to decode, so it isn't
+/// retried every frame (only on the next `forget_changed`).
 pub struct Thumbnails {
-    textures: HashMap<PathBuf, Option<egui::TextureHandle>>,
+    textures: HashMap<PathBuf, Cached>,
     pending: HashSet<PathBuf>,
     requests: Sender<Request>,
     results: Receiver<Decoded>,
@@ -60,10 +69,14 @@ impl Thumbnails {
                     if request.generation != generation.load(Ordering::Relaxed) {
                         continue;
                     }
+                    let modified = std::fs::metadata(&request.path)
+                        .and_then(|m| m.modified())
+                        .ok();
                     let image = decode_thumbnail(&request.path);
                     let decoded = Decoded {
                         path: request.path,
                         generation: request.generation,
+                        modified,
                         image,
                     };
                     if res_tx.send(decoded).is_err() {
@@ -97,12 +110,34 @@ impl Thumbnails {
                     egui::TextureOptions::LINEAR,
                 )
             });
-            self.textures.insert(decoded.path, texture);
+            self.textures.insert(
+                decoded.path,
+                Cached {
+                    modified: decoded.modified,
+                    texture,
+                },
+            );
         }
     }
 
     pub fn get(&self, path: &Path) -> Option<&egui::TextureHandle> {
-        self.textures.get(path).and_then(Option::as_ref)
+        self.textures.get(path).and_then(|c| c.texture.as_ref())
+    }
+
+    /// Drops thumbnails whose file changed (or vanished) since decoding, and
+    /// failed decodes — a file that was still being written then may be
+    /// complete now.
+    pub fn forget_changed<'a>(
+        &mut self,
+        current: impl IntoIterator<Item = (&'a Path, Option<SystemTime>)>,
+    ) {
+        let current: HashMap<&Path, Option<SystemTime>> = current.into_iter().collect();
+        self.textures.retain(|path, cached| {
+            cached.texture.is_some()
+                && current
+                    .get(path.as_path())
+                    .is_some_and(|modified| *modified == cached.modified)
+        });
     }
 
     /// Queues `path` for decoding unless it's already cached or queued.
@@ -167,6 +202,33 @@ mod tests {
         assert_eq!(square_thumbnail(&wide).size, [THUMB_PX as usize; 2]);
         let tall = image::DynamicImage::new_rgba8(50, 300);
         assert_eq!(square_thumbnail(&tall).size, [50, 50]);
+    }
+
+    #[test]
+    fn forget_changed_keeps_only_unchanged_successful_decodes() {
+        let ctx = egui::Context::default();
+        let mut thumbs = Thumbnails::new(&ctx);
+        let t0 = SystemTime::UNIX_EPOCH;
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        let texture = ctx.load_texture("t", egui::ColorImage::example(), Default::default());
+        for (name, modified, texture) in [
+            ("same.png", Some(t0), Some(texture.clone())),
+            ("edited.png", Some(t0), Some(texture.clone())),
+            ("gone.png", Some(t0), Some(texture)),
+            ("failed.png", Some(t0), None),
+        ] {
+            thumbs
+                .textures
+                .insert(PathBuf::from(name), Cached { modified, texture });
+        }
+        thumbs.forget_changed([
+            (Path::new("same.png"), Some(t0)),
+            (Path::new("edited.png"), Some(t1)),
+            (Path::new("failed.png"), Some(t0)),
+        ]);
+        let mut left: Vec<_> = thumbs.textures.keys().cloned().collect();
+        left.sort();
+        assert_eq!(left, vec![PathBuf::from("same.png")]);
     }
 
     #[test]
