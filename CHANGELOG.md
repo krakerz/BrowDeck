@@ -1,5 +1,11 @@
 ## [Unreleased]
 
+## [1.12.1] — 2026-10-17
+
+### Fixed
+- The on-screen keyboard now opens automatically in Steam Game Mode on
+  devices that aren't running stock SteamOS
+
 ## [1.12.0] — 2026-10-17
 
 ### Added
