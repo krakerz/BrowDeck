@@ -245,6 +245,11 @@ pub struct BrowDeckApp {
     /// Whether this app asked Steam to show its keyboard, so leaving edit
     /// mode closes only a keyboard it opened.
     osk_open: bool,
+    /// This frame's real name/password `TextEdit`, if one is in editing
+    /// mode — the keyboard echo reads its cursor from egui's state.
+    editing_field_id: Option<egui::Id>,
+    /// This frame's search `TextEdit`, while the search bar is open.
+    search_field_id: Option<egui::Id>,
     search_query: String,
     search_open: bool,
     /// One-shot flags consumed the next time the relevant widget is drawn.
@@ -474,6 +479,8 @@ impl BrowDeckApp {
             rename_editing: false,
             osk_available: osk::available(),
             osk_open: false,
+            editing_field_id: None,
+            search_field_id: None,
             rename_focus_pending: false,
             compress_editing: false,
             compress_focus_pending: false,
@@ -1977,6 +1984,8 @@ impl BrowDeckApp {
                             .hint_text("Password")
                             .desired_width(160.0),
                     );
+                    Self::cursor_to_end_on_focus(ui.ctx(), &text_resp, &password);
+                    self.editing_field_id = Some(text_resp.id);
                     field_id = Some(text_resp.id);
                     row_ids.push(text_resp.id);
                     if text_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -2257,6 +2266,8 @@ impl BrowDeckApp {
 impl eframe::App for BrowDeckApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.reassert_window_size(ui.ctx());
+        self.editing_field_id = None;
+        self.search_field_id = None;
         self.thumbnails.poll(ui.ctx());
         let previously_unfinished: Vec<bool> = self.jobs.iter().map(|j| !j.finished).collect();
         for job in &mut self.jobs {
@@ -3011,14 +3022,21 @@ impl eframe::App for BrowDeckApp {
 
 impl BrowDeckApp {
     /// Opens Steam's keyboard when a name/password field enters editing
-    /// mode (A on the field) and closes it when editing ends, so the user
+    /// mode (A on the field) or the search bar takes focus, and closes it
+    /// when that ends, so the user
     /// doesn't have to summon it from Steam's menu each time. Only with a
     /// pad connected: with a real keyboard it would just be in the way.
     fn sync_on_screen_keyboard(&mut self, ctx: &egui::Context) {
         if !self.osk_available {
             return;
         }
-        let editing = self.rename_editing || self.compress_editing || self.password_prompt_editing;
+        let search_focused = self
+            .search_field_id
+            .is_some_and(|id| ctx.memory(|m| m.has_focus(id)));
+        let editing = self.rename_editing
+            || self.compress_editing
+            || self.password_prompt_editing
+            || search_focused;
         if editing && !self.osk_open {
             if !self.gamepad.as_ref().is_some_and(|g| g.has_connected_pad()) {
                 return;
@@ -3041,10 +3059,26 @@ impl BrowDeckApp {
         }
     }
 
+    /// Puts the cursor after the last character (extension included)
+    /// whenever the field takes focus — egui does that only the first time,
+    /// then restores wherever the previous edit left it.
+    fn cursor_to_end_on_focus(ctx: &egui::Context, response: &egui::Response, text: &str) {
+        if !response.gained_focus() {
+            return;
+        }
+        let mut state = egui::TextEdit::load_state(ctx, response.id).unwrap_or_default();
+        let end = egui::text::CCursor::new(text.chars().count());
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(end)));
+        state.store(ctx, response.id);
+    }
+
     /// Steam's on-screen keyboard covers the bottom of the screen, where
     /// every name/password field lives — so while one is being typed into
-    /// with a pad connected, its text is mirrored near the top. Display
-    /// only: input still goes to the real field below.
+    /// with a pad connected, its text and cursor are mirrored near the top.
+    /// Display only: input still goes to the real field below. The search
+    /// bar is already at the top, so it gets none.
     fn show_keyboard_echo(&self, ctx: &egui::Context) {
         if !self.gamepad.as_ref().is_some_and(|g| g.has_connected_pad()) {
             return;
@@ -3069,6 +3103,12 @@ impl BrowDeckApp {
         } else {
             return;
         };
+        let cursor = self
+            .editing_field_id
+            .and_then(|id| egui::TextEdit::load_state(ctx, id))
+            .and_then(|state| state.cursor.char_range())
+            .map_or(usize::MAX, |range| range.primary.index.0);
+        let echo = Self::echo_with_caret(ctx, &text, cursor);
         egui::Area::new(egui::Id::new("keyboard_echo"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 48.0))
@@ -3079,9 +3119,26 @@ impl BrowDeckApp {
                     .show(ui, |ui| {
                         ui.set_min_width(ctx.content_rect().width() * 0.6);
                         ui.weak(label);
-                        ui.heading(text);
+                        ui.label(echo);
                     });
             });
+    }
+
+    /// `text` with a caret drawn at char index `cursor` (clamped to the end).
+    fn echo_with_caret(ctx: &egui::Context, text: &str, cursor: usize) -> egui::text::LayoutJob {
+        let split = text
+            .char_indices()
+            .nth(cursor)
+            .map_or(text.len(), |(byte, _)| byte);
+        let style = ctx.global_style();
+        let font = egui::TextStyle::Heading.resolve(&style);
+        let plain = egui::TextFormat::simple(font.clone(), style.visuals.strong_text_color());
+        let caret = egui::TextFormat::simple(font, style.visuals.selection.stroke.color);
+        let mut job = egui::text::LayoutJob::default();
+        job.append(&text[..split], 0.0, plain.clone());
+        job.append("|", 0.0, caret);
+        job.append(&text[split..], 0.0, plain);
+        job
     }
 
     fn show_sidebar_contents(&mut self, ui: &mut egui::Ui) {
@@ -3246,6 +3303,8 @@ impl BrowDeckApp {
                         .hint_text("Search this folder…")
                         .desired_width(f32::INFINITY),
                 );
+                Self::cursor_to_end_on_focus(ui.ctx(), &search_resp, &self.search_query);
+                self.search_field_id = Some(search_resp.id);
                 if self.focus_search {
                     search_resp.request_focus();
                     self.focus_search = false;
@@ -4026,6 +4085,8 @@ impl BrowDeckApp {
                         .hint_text("Name")
                         .desired_width(220.0),
                 );
+                Self::cursor_to_end_on_focus(ui.ctx(), &text_resp, &text);
+                self.editing_field_id = Some(text_resp.id);
                 field_id = Some(text_resp.id);
                 row_ids.push(text_resp.id);
                 if text_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -4263,6 +4324,8 @@ impl BrowDeckApp {
                         .hint_text("Name")
                         .desired_width(220.0),
                 );
+                Self::cursor_to_end_on_focus(ui.ctx(), &text_resp, &text);
+                self.editing_field_id = Some(text_resp.id);
                 field_id = Some(text_resp.id);
                 row_ids.push(text_resp.id);
             } else {
@@ -4410,6 +4473,16 @@ impl BrowDeckApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyboard_echo_caret_lands_on_char_boundaries() {
+        let ctx = egui::Context::default();
+        let rendered = |text: &str, cursor| BrowDeckApp::echo_with_caret(&ctx, text, cursor).text;
+        assert_eq!(rendered("text.txt", 4), "text|.txt");
+        assert_eq!(rendered("text.txt", usize::MAX), "text.txt|");
+        assert_eq!(rendered("日本.txt", 1), "日|本.txt");
+        assert_eq!(rendered("", 0), "|");
+    }
 
     fn entry(name: &str, is_dir: bool, size: u64, modified_secs: u64) -> Entry {
         Entry {

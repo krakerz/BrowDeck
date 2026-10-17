@@ -1,5 +1,17 @@
 ## [Unreleased]
 
+## [1.13.0] — 2026-10-17
+
+### Added
+- The on-screen keyboard also opens when the search bar is focused in
+  Steam Game Mode
+
+### Changed
+- Name and password fields start with the cursor after the last
+  character, extension included
+- The text shown above the on-screen keyboard now includes a cursor that
+  follows the real one
+
 ## [1.12.1] — 2026-10-17
 
 ### Fixed
